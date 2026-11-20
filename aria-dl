@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+"""aria-dl: reusable downloader for torrent files, magnet links, http(s) URLs (aria2c) and video sites (yt-dlp).
+
+Usage:
+  aria-dl add SOURCE [SOURCE ...] [--file FILE] [--dir DIR] [--when now|night] [--name LABEL] [--limit RATE] [--media] [--audio] [--max-height N] [--json]
+  aria-dl list [--json]
+  aria-dl status ID [ID ...] [--json]
+  aria-dl pause ID [ID ...] | all [--json]
+  aria-dl resume ID [ID ...] | all [--json]
+  aria-dl remove ID [ID ...]                     (forgets jobs, never deletes downloaded files)
+  aria-dl log ID [-n N]
+  aria-dl tick                                   (run by launchd every 15 min and on job exit)
+
+Multiple tasks:
+  - Pass several SOURCE arguments at once
+  - Or pass --file urls.txt (-f - for stdin), one source per line (# comments and blank lines ignored)
+  - Or pipe lines into stdin: pbpaste | aria-dl add --when night
+
+--when now   : start immediately, any network (default)
+--when night : only 22:00-08:00 and only when the default route is Wi-Fi; pauses outside that
+Concurrency  : up to 2 media (yt-dlp) + 3 aria2c jobs run at once; extras queue and auto-start as slots free.
+Jobs live in ~/.local/share/aria-dl/jobs/<ID>/ ; downloads resume automatically (--continue).
+"""
+import argparse, fcntl, hashlib, json, os, re, signal, subprocess, sys, time, shutil, datetime
+
+HOME = os.path.expanduser("~")
+BASE = os.path.join(HOME, ".local/share/aria-dl")
+JOBS = os.path.join(BASE, "jobs")
+LOCK = os.path.join(BASE, ".tick.lock")
+PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+TRACKERS_URL = "https://cf.trackerslist.com/best_aria2.txt"
+MEDIA_HOSTS = re.compile(r"^https?://([\w-]+\.)*(youtube\.com|youtu\.be|bilibili\.com|b23\.tv|x\.com|twitter\.com|vimeo\.com|nicovideo\.jp|tiktok\.com|instagram\.com|soundcloud\.com)(/|$)", re.I)
+YTP = re.compile(r"\[download\]\s+([\d.]+)% of\s+~?\s*([\d.]+\w*B)(?: at\s+([\d.]+\w*B/s|Unknown B/s))?(?: ETA (\S+))?")
+COOKIES = os.path.join(BASE, "cookies", "youtube.txt")
+PROG = re.compile(r"\[#\w+ ([\d.]+\w*B)/([\d.]+\w*B)\((\d+)%\) CN:(\d+)(?: SD:(\d+))? DL:([\d.]+\w*B)(?: ETA:(\S+?))?\]")
+MAX_MEDIA = int(os.environ.get("ARIA_DL_MAX_MEDIA", "2"))
+MAX_ARIA = int(os.environ.get("ARIA_DL_MAX_ARIA", "3"))
+
+def now(): return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def jdir(i): return os.path.join(JOBS, i)
+def load(i):
+    with open(os.path.join(jdir(i), "job.json")) as f: return json.load(f)
+def save(j):
+    p = os.path.join(jdir(j["id"]), "job.json"); t = p + ".tmp"
+    with open(t, "w") as f: json.dump(j, f, ensure_ascii=False, indent=1)
+    os.replace(t, p)
+def alive(pid):
+    try: os.kill(pid, 0); return True
+    except Exception: return False
+def kind_of(src, media=False):
+    if src.startswith("magnet:"): return "magnet"
+    if media or MEDIA_HOSTS.match(src): return "media"
+    if re.match(r"^(https?|ftp)://", src): return "url"
+    if os.path.isfile(os.path.expanduser(src)): return "torrent"
+    raise ValueError(f"unknown source (not magnet, URL or existing file): {src}")
+
+def wifi_default():
+    try:
+        hw = subprocess.run(["networksetup", "-listallhardwareports"], capture_output=True, text=True).stdout
+        m = re.search(r"Hardware Port: Wi-Fi\nDevice: (\S+)", hw)
+        r = subprocess.run(["route", "-n", "get", "default"], capture_output=True, text=True).stdout
+        m2 = re.search(r"interface: (\S+)", r)
+        return bool(m and m2 and m.group(1) == m2.group(1))
+    except Exception: return False
+def night_ok():
+    h = datetime.datetime.now().hour
+    return (h >= 22 or h < 8) and wifi_default()
+
+def pool_of(j): return "media" if j.get("kind") == "media" else "aria"
+def pool_cap(pool): return MAX_MEDIA if pool == "media" else MAX_ARIA
+
+def progress(j):
+    lp = os.path.join(jdir(j["id"]), "aria2.log"); last = None
+    try:
+        with open(lp, "rb") as f:
+            f.seek(0, 2); f.seek(max(0, f.tell() - 20000))
+            for line in f.read().decode("utf-8", "ignore").splitlines():
+                m = PROG.search(line)
+                if m: last = m
+    except FileNotFoundError: pass
+    if not last:
+        try:
+            with open(lp, "rb") as f:
+                f.seek(0, 2); f.seek(max(0, f.tell() - 20000)); y = None
+                for line in f.read().decode("utf-8", "ignore").splitlines():
+                    m = YTP.search(line)
+                    if m: y = m
+            if y: return {"percent": int(float(y.group(1))), "total": y.group(2), "speed": y.group(3), "eta": y.group(4), "connections": None}
+        except FileNotFoundError: pass
+        return {}
+    return {"done": last.group(1), "total": last.group(2), "percent": int(last.group(3)),
+            "connections": int(last.group(4)), "seeds": int(last.group(5)) if last.group(5) else None,
+            "speed": last.group(6) + "/s", "eta": last.group(7)}
+
+def refresh(j):
+    if j["state"] == "running":
+        ec = os.path.join(jdir(j["id"]), "exitcode")
+        if os.path.exists(ec) or not alive(j.get("pid") or 0):
+            try: code = int(open(ec).read().strip()) if os.path.exists(ec) else None
+            except Exception: code = None
+            j["exit_code"] = code; j["pid"] = None; j["ended"] = now()
+            j["state"] = "complete" if code == 0 else ("failed" if code not in (None, 7) else "waiting")
+            save(j)
+    return j
+
+def start(j):
+    d = jdir(j["id"]); os.makedirs(os.path.expanduser(j["dir"]), exist_ok=True)
+    ec = os.path.join(d, "exitcode")
+    if os.path.exists(ec): os.remove(ec)
+    if j["kind"] == "media":
+        args = ["yt-dlp", "--newline", "--continue", "--no-overwrites", "--embed-metadata",
+                "-o", os.path.join(os.path.expanduser(j["dir"]), "%(title).150B [%(id)s].%(ext)s")]
+        if j.get("audio"): args += ["-x", "--audio-format", "m4a"]
+        else: args += ["-f", "bv*[height<=?%s]+ba/b" % (j.get("max_height") or 1080), "--merge-output-format", "mp4"]
+        if j.get("limit"): args += ["-r", j["limit"]]
+        if os.path.exists(COOKIES): args += ["--cookies", COOKIES]
+        args.append(j["source"])
+        return launch(j, d, args)
+    args = ["aria2c", "--continue=true", "--summary-interval=60", "--console-log-level=notice",
+            "-d", os.path.expanduser(j["dir"])]
+    if j["kind"] in ("magnet", "torrent") or j["source"].endswith(".torrent"):
+        tr = ""
+        try: tr = subprocess.run(["curl", "-fsSL", "--max-time", "20", TRACKERS_URL], capture_output=True, text=True).stdout.strip()
+        except Exception: pass
+        if tr: args.append("--bt-tracker=" + tr)
+        args += ["--enable-dht=true", "--enable-peer-exchange=true", "--bt-enable-lpd=true",
+                 "--peer-id-prefix=-TR2770-", "--user-agent=Transmission/2.77", "--peer-agent=Transmission/2.77",
+                 "--bt-max-peers=100", "--seed-time=0", "--bt-save-metadata=true", "--follow-torrent=true"]
+    else:
+        args += ["-x8", "-s8", "-k1M", "--max-tries=0", "--retry-wait=30"]
+    if j.get("limit"): args.append("--max-overall-download-limit=" + j["limit"])
+    args.append(j.get("local_torrent") or j["source"])
+    return launch(j, d, args)
+
+def launch(j, d, args):
+    log = open(os.path.join(d, "aria2.log"), "a")
+    log.write(f"\n==== start {now()} ====\n"); log.flush()
+    me = os.path.realpath(__file__)
+    script = 'd="$1"; me="$2"; shift 2; cd "$d"; "$@"; rc=$?; echo $rc > exitcode.tmp && mv exitcode.tmp exitcode; "$me" tick >/dev/null 2>&1 || true; exit $rc'
+    p = subprocess.Popen(["/bin/sh", "-c", script, "sh", d, me] + args, stdout=log, stderr=log,
+                         stdin=subprocess.DEVNULL, start_new_session=True, env={**os.environ, "PATH": PATH})
+    j.update(state="running", pid=p.pid, started=now()); save(j)
+
+def stop(j, newstate):
+    pid = j.get("pid")
+    if pid and alive(pid):
+        try: os.killpg(pid, signal.SIGINT)   # aria2 saves .aria2 control file on SIGINT
+        except Exception: pass
+        for _ in range(30):
+            if not alive(pid): break
+            time.sleep(1)
+        if alive(pid):
+            try: os.killpg(pid, signal.SIGKILL)
+            except Exception: pass
+    j.update(state=newstate, pid=None); save(j)
+
+def view(j):
+    v = {k: j.get(k) for k in ("id", "name", "kind", "source", "dir", "when", "state", "created", "started", "ended", "exit_code")}
+    v.update(progress(j))
+    if j.get("state") == "complete": v.update(percent=100, done=v.get("total"), speed="0B/s", eta=None)
+    return v
+
+def all_jobs():
+    os.makedirs(JOBS, exist_ok=True)
+    return [refresh(load(i)) for i in sorted(os.listdir(JOBS)) if os.path.exists(os.path.join(jdir(i), "job.json"))]
+
+def find(i):
+    ms = [x for x in os.listdir(JOBS) if x.startswith(i)] if os.path.isdir(JOBS) else []
+    if len(ms) != 1: sys.exit(f"aria-dl: no unique job matching {i}")
+    return refresh(load(ms[0]))
+
+def tick():
+    os.makedirs(BASE, exist_ok=True)
+    with open(LOCK, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        jobs = all_jobs()
+        night = None
+        for j in jobs:
+            if j["state"] == "running" and j["when"] == "night":
+                if night is None: night = night_ok()
+                if not night: stop(j, "waiting")
+        running = {"media": 0, "aria": 0}
+        for j in jobs:
+            if j["state"] == "running": running[pool_of(j)] += 1
+        # Prefer "now" jobs over "night" jobs, then older created first
+        candidates = [j for j in jobs if j["state"] in ("queued", "waiting")]
+        candidates.sort(key=lambda x: (0 if x.get("when") == "now" else 1, x.get("created_ts") or 0, x.get("created") or ""))
+        for j in candidates:
+            pool = pool_of(j)
+            if running[pool] >= pool_cap(pool): continue
+            if j["when"] == "night":
+                if night is None: night = night_ok()
+                if not night:
+                    if j["state"] == "queued": j["state"] = "waiting"; save(j)
+                    continue
+            start(j)
+            running[pool] += 1
+
+def out(obj, as_json):
+    if as_json: print(json.dumps(obj, ensure_ascii=False, indent=1)); return
+    rows = obj if isinstance(obj, list) else [obj]
+    for v in rows:
+        if v.get("percent") is not None:
+            if v.get("done") is not None:
+                pr = f"{v['percent']}% {v['done']}/{v.get('total','?')} {v.get('speed','')}"
+            else:
+                pr = f"{v['percent']}% {v.get('total','?')} {v.get('speed','')}"
+            if v.get("connections") is not None:
+                pr += f" peers:{v['connections']}"
+        else:
+            pr = ""
+        print(f"{v['id']}  {v['state']:<8} {v['when']:<5} {pr}  {v['name']}")
+
+def collect_sources(o):
+    raw = list(o.sources or [])
+    from_batch = bool(o.file) or len(raw) > 1
+    if o.file:
+        f = sys.stdin if o.file == "-" else open(os.path.expanduser(o.file))
+        with f:
+            raw.extend(f.read().splitlines())
+    elif not raw and not sys.stdin.isatty():
+        from_batch = True
+        raw.extend(sys.stdin.read().splitlines())
+    seen, sources = set(), []
+    for line in raw:
+        s = line.strip()
+        if not s or s.startswith("#"): continue
+        if s not in seen:
+            seen.add(s); sources.append(s)
+    if not sources:
+        sys.exit("aria-dl: no sources provided (pass URLs/files, --file FILE, or pipe via stdin)")
+    return sources, from_batch
+
+def add_one(raw_src, o, label=None):
+    k = kind_of(raw_src, o.media)
+    src = os.path.abspath(os.path.expanduser(raw_src)) if k == "torrent" else raw_src
+    i = hashlib.sha1(src.encode()).hexdigest()[:8]
+    if os.path.exists(os.path.join(jdir(i), "job.json")):
+        j = refresh(load(i))
+        if j["state"] not in ("complete", "running"):
+            j.update(when=o.when, dir=o.dir, limit=o.limit or j.get("limit"),
+                     audio=o.audio or j.get("audio"), max_height=o.max_height or j.get("max_height"),
+                     state="queued")
+            save(j)
+    else:
+        os.makedirs(jdir(i), exist_ok=True)
+        default_name = (re.search(r"dn=([^&]+)", src) or [None, src[:60]])[1] if k == "magnet" else (os.path.basename(src)[:80] or src[:80])
+        j = {"id": i, "kind": k, "source": src, "dir": o.dir, "when": o.when, "limit": o.limit,
+             "audio": o.audio, "max_height": o.max_height,
+             "name": label or default_name,
+             "state": "queued", "created": now(), "created_ts": time.time(), "pid": None}
+        if k == "torrent":
+            lt = os.path.join(jdir(i), "source.torrent"); shutil.copy(src, lt); j["local_torrent"] = lt
+        save(j)
+    return j["id"]
+
+def main():
+    ap = argparse.ArgumentParser(prog="aria-dl", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sp = ap.add_subparsers(dest="cmd", required=True)
+    a = sp.add_parser("add")
+    a.add_argument("sources", nargs="*", help="one or more .torrent paths, magnet links, or URLs")
+    a.add_argument("-f", "--file", help="read sources from file (one per line, - for stdin)")
+    a.add_argument("--dir", default="~/Downloads")
+    a.add_argument("--when", choices=["now", "night"], default="now"); a.add_argument("--name"); a.add_argument("--limit")
+    a.add_argument("--media", action="store_true", help="force yt-dlp for any video site URL")
+    a.add_argument("--audio", action="store_true", help="media: audio only (m4a)")
+    a.add_argument("--max-height", type=int, help="media: max video height, default 1080")
+    a.add_argument("--json", action="store_true")
+    l = sp.add_parser("list"); l.add_argument("--json", action="store_true")
+    for c in ("status", "pause", "resume", "remove"):
+        p = sp.add_parser(c); p.add_argument("ids", nargs="+"); p.add_argument("--json", action="store_true")
+    g = sp.add_parser("log"); g.add_argument("id"); g.add_argument("-n", type=int, default=20)
+    sp.add_parser("tick")
+    o = ap.parse_args()
+    os.makedirs(JOBS, exist_ok=True)
+    if o.cmd == "add":
+        sources, from_batch = collect_sources(o)
+        ids, errors = [], []
+        for idx, s in enumerate(sources, 1):
+            label = f"{o.name} #{idx}" if (o.name and len(sources) > 1) else o.name
+            try:
+                ids.append(add_one(s, o, label=label))
+            except Exception as e:
+                errors.append({"source": s, "error": str(e)})
+                print(f"aria-dl: error adding {s}: {e}", file=sys.stderr)
+        if ids: tick()
+        views = [view(refresh(load(i))) for i in ids]
+        if from_batch:
+            if o.json: out(views + errors if errors else views, True)
+            else: out(views, False)
+        elif views:
+            out(views[0], o.json)
+        if errors: sys.exit(1)
+    elif o.cmd == "list": out([view(j) for j in all_jobs()], o.json)
+    elif o.cmd == "status":
+        views = [view(find(i)) for i in o.ids]
+        out(views if len(views) > 1 else views[0], o.json)
+    elif o.cmd == "pause":
+        targets = [j for j in all_jobs() if j["state"] in ("running", "queued", "waiting")] if o.ids == ["all"] else [find(i) for i in o.ids]
+        for j in targets: stop(j, "paused")
+        views = [view(j) for j in targets]
+        out(views if (len(o.ids) > 1 or o.ids == ["all"]) else (views[0] if views else []), o.json)
+    elif o.cmd == "resume":
+        targets = [j for j in all_jobs() if j["state"] in ("paused", "failed", "waiting")] if o.ids == ["all"] else [find(i) for i in o.ids]
+        for j in targets: j["state"] = "queued"; save(j)
+        tick()
+        views = [view(refresh(load(j["id"]))) for j in targets]
+        out(views if (len(o.ids) > 1 or o.ids == ["all"]) else (views[0] if views else []), o.json)
+    elif o.cmd == "remove":
+        for i in o.ids:
+            j = find(i); stop(j, "removed"); shutil.rmtree(jdir(j["id"]))
+            print(f"removed job {j['id']} (files kept in {j['dir']})")
+        tick()
+    elif o.cmd == "log":
+        j = find(o.id); subprocess.run(["tail", f"-n{o.n}", os.path.join(jdir(j["id"]), "aria2.log")])
+    elif o.cmd == "tick": tick()
+
+if __name__ == "__main__": main()
