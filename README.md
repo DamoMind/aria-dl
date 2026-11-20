@@ -34,7 +34,7 @@ cd aria-dl
 ./install.sh
 ```
 
-`install.sh` installs `aria-dl` to `~/.local/bin/aria-dl` (symlinking to `/usr/local/bin/aria-dl` if writable) and, on macOS, registers a LaunchAgent (`com.damomind.aria-dl`) that runs `aria-dl tick` every 60 seconds as a safety net for night windows, retries, and reboots. A pending retry also schedules one delayed `tick` at its backoff deadline, so a short wait is not pushed out to the next periodic run.
+`install.sh` installs `aria-dl` to `~/.local/bin/aria-dl` (symlinking to `/usr/local/bin/aria-dl` if writable) and, on macOS, registers a LaunchAgent (`com.damomind.aria-dl`) that runs `aria-dl tick` every 60 seconds as a safety net for night windows, retries, and reboots. A pending retry also schedules one delayed `tick` at its backoff deadline, so a short wait is not pushed out to the next periodic run. On macOS, `./install.sh --cookies` also runs `aria-dl cookies refresh` in the foreground at the end.
 
 ## Usage
 
@@ -138,6 +138,26 @@ Only one of `--cookies-from-browser` or `--cookies` is passed to `yt-dlp`. Cooki
 On macOS, Safari needs Full Disk Access for the terminal. Chrome may prompt for Keychain access once.
 
 Keep the cookies directory mode `700` and never commit cookies to git. If a media download fails with YouTube's "Sign in to confirm you're not a bot" check, the job records `last_error` as `youtube_bot_check`, retries still run, and `aria-dl status` adds `hint: set --cookies-from-browser chrome`.
+
+## YouTube cookies on macOS
+
+LaunchAgent and other background jobs cannot read Chrome, Brave, Edge, Firefox, Safari, or Vivaldi profile directories. macOS TCC returns "Operation not permitted", and yt-dlp then reports that it could not find the cookies database. Import the cookies once from a foreground Terminal, then let background downloads use the file.
+
+```bash
+aria-dl cookies refresh                 # auto: first logged-in browser
+aria-dl cookies refresh --browser chrome
+aria-dl cookies refresh --browser 'chrome:Profile 1'
+aria-dl cookies status
+./install.sh --cookies                  # macOS: same refresh at the end of install
+```
+
+`auto` tries chrome, brave, edge, firefox, safari, then vivaldi, and keeps the first export that contains a logged-in YouTube session (`SAPISID`, `__Secure-3PSID`, or `LOGIN_INFO`). The default browser is `cookies_from_browser` from the environment or `config.json` when that is set, otherwise `auto`. Only `youtube.com` and `google.com` cookies are kept. The file is written atomically, mode `0600`, to `~/.local/share/aria-dl/cookies/youtube.txt`. If that path is a symlink, the bytes go to the symlink target. Cookie values are never printed.
+
+If macOS blocks the read, `cookies refresh` tells you to run it again from Terminal and allow the "access data from other apps" prompt, or to grant Terminal Full Disk Access. Chrome also asks for Keychain "Chrome Safe Storage"; click Always Allow.
+
+`cookies status` reports the file path, age, cookie count, whether a login cookie is present, and the earliest expiry. It does not print names' values.
+
+When a media job fails the YouTube bot check, aria-dl tries one silent `cookies refresh` at most once per hour before the normal retry (under launchd that refresh usually fails, which is expected). If a job was started with `cookies_from_browser` and yt-dlp fails because the cookies database is blocked while that browser profile directory exists, the same attempt falls back to the cookies file instead of counting as a failure.
 
 ## Security & Privacy Notes
 

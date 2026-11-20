@@ -5,6 +5,12 @@ BIN_DIR="${HOME}/.local/bin"
 DATA_DIR="${HOME}/.local/share/aria-dl"
 PLIST="${HOME}/Library/LaunchAgents/com.damomind.aria-dl.plist"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+DO_COOKIES=0
+for arg in "$@"; do
+  case "$arg" in
+    --cookies) DO_COOKIES=1 ;;
+  esac
+done
 
 mkdir -p "$BIN_DIR" "$DATA_DIR/jobs" "$DATA_DIR/cookies"
 chmod 700 "$DATA_DIR/cookies"
@@ -60,3 +66,10 @@ PLIST_EOF
 fi
 
 echo "Installed aria-dl to ${BIN_DIR}/aria-dl"
+if [ "$DO_COOKIES" -eq 1 ]; then
+  if [ "$(uname -s)" = "Darwin" ]; then
+    "$BIN_DIR/aria-dl" cookies refresh
+  else
+    echo "Note: --cookies runs the browser import on macOS. Use 'aria-dl cookies refresh' here if you still want it."
+  fi
+fi
