@@ -2,14 +2,14 @@
 """aria-dl: reusable downloader for torrent files, magnet links, http(s) URLs (aria2c) and video sites (yt-dlp).
 
 Usage:
-  aria-dl add SOURCE [SOURCE ...] [--file FILE] [--dir DIR] [--when now|night] [--name LABEL] [--limit RATE] [--media] [--audio] [--max-height N] [--json]
+  aria-dl add SOURCE [SOURCE ...] [--file FILE] [--dir DIR] [--when now|night] [--name LABEL] [--limit RATE] [--retries N] [--media] [--audio] [--max-height N] [--json]
   aria-dl list [--json]
   aria-dl status ID [ID ...] [--json]
   aria-dl pause ID [ID ...] | all [--json]
   aria-dl resume ID [ID ...] | all [--json]
   aria-dl remove ID [ID ...]                     (forgets jobs, never deletes downloaded files)
   aria-dl log ID [-n N]
-  aria-dl tick                                   (run by launchd every 15 min and on job exit)
+  aria-dl tick                                   (LaunchAgent safety net, on job exit, and at the next retry)
 
 Multiple tasks:
   - Pass several SOURCE arguments at once
@@ -19,6 +19,11 @@ Multiple tasks:
 --when now   : start immediately, any network (default)
 --when night : only 22:00-08:00 and only when the default route is Wi-Fi; pauses outside that
 Concurrency  : up to 2 media (yt-dlp) + 3 aria2c jobs run at once; extras queue and auto-start as slots free.
+Retries      : yt-dlp is started with --retries 5 --fragment-retries 5 --retry-sleep exp=1:30.
+               A non-zero exit (except aria2c code 7, which stays "waiting") is retried
+               --retries N times (default 5, env ARIA_DL_MAX_RETRIES, 0 disables) in state
+               "retrying", with backoff 2m, 5m, 15m, 30m, then 60m. One sleeper runs tick
+               at the next retry time. resume of a failed or retrying job resets the counter.
 Jobs live in ~/.local/share/aria-dl/jobs/<ID>/ ; downloads resume automatically (--continue).
 """
 import argparse, fcntl, hashlib, json, os, re, signal, subprocess, sys, time, shutil, datetime
@@ -35,6 +40,18 @@ COOKIES = os.path.join(BASE, "cookies", "youtube.txt")
 PROG = re.compile(r"\[#\w+ ([\d.]+\w*B)/([\d.]+\w*B)\((\d+)%\) CN:(\d+)(?: SD:(\d+))? DL:([\d.]+\w*B)(?: ETA:(\S+?))?\]")
 MAX_MEDIA = int(os.environ.get("ARIA_DL_MAX_MEDIA", "2"))
 MAX_ARIA = int(os.environ.get("ARIA_DL_MAX_ARIA", "3"))
+try: DEFAULT_RETRIES = max(0, int(os.environ.get("ARIA_DL_MAX_RETRIES", "5")))
+except (TypeError, ValueError): DEFAULT_RETRIES = 5
+RETRY_BACKOFFS = (120, 300, 900, 1800, 3600)  # 2m, 5m, 15m, 30m, 60m
+WAKE = os.path.join(BASE, ".retry-wake.json")
+# Sleep, drop this wake record only if its token is still current, then exec tick.
+# Deleting first keeps tick from observing its own pid; a replaced sleeper keeps its record.
+WAKE_SCRIPT = (
+    'sleep "$1"; wake="$2"; token="$3"; me="$4"; cur=""; '
+    '[ -f "$wake" ] && cur=$(cat "$wake"); '
+    'case "$cur" in *"$token"*) rm -f "$wake";; esac; '
+    'exec "$me" tick'
+)
 
 def now(): return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 def jdir(i): return os.path.join(JOBS, i)
@@ -92,15 +109,35 @@ def progress(j):
             "connections": int(last.group(4)), "seeds": int(last.group(5)) if last.group(5) else None,
             "speed": last.group(6) + "/s", "eta": last.group(7)}
 
+def retry_limit(j):
+    limit = j.get("max_retries")
+    return limit if type(limit) is int else DEFAULT_RETRIES
+def retry_delay(count):
+    return RETRY_BACKOFFS[min(max(int(count), 1), len(RETRY_BACKOFFS)) - 1]
+def mark_stopped(j, code):
+    j["exit_code"] = code; j["pid"] = None; j["ended"] = now()
+    if code == 0:
+        j["next_retry_ts"] = j["next_retry_at"] = None
+        j["state"] = "complete"
+        return
+    if code in (None, 7):
+        j["state"] = "waiting"
+        return
+    limit = retry_limit(j); count = int(j.get("retry_count") or 0); j["max_retries"] = limit
+    if limit > 0 and count < limit:
+        count += 1
+        ts = time.time() + retry_delay(count)
+        j.update(retry_count=count, next_retry_ts=ts, state="retrying",
+                 next_retry_at=datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S"))
+        return
+    j.update(retry_count=count, next_retry_ts=None, next_retry_at=None, state="failed")
 def refresh(j):
     if j["state"] == "running":
         ec = os.path.join(jdir(j["id"]), "exitcode")
         if os.path.exists(ec) or not alive(j.get("pid") or 0):
             try: code = int(open(ec).read().strip()) if os.path.exists(ec) else None
             except Exception: code = None
-            j["exit_code"] = code; j["pid"] = None; j["ended"] = now()
-            j["state"] = "complete" if code == 0 else ("failed" if code not in (None, 7) else "waiting")
-            save(j)
+            mark_stopped(j, code); save(j)
     return j
 
 def start(j):
@@ -109,6 +146,7 @@ def start(j):
     if os.path.exists(ec): os.remove(ec)
     if j["kind"] == "media":
         args = ["yt-dlp", "--newline", "--continue", "--no-overwrites", "--embed-metadata",
+                "--retries", "5", "--fragment-retries", "5", "--retry-sleep", "exp=1:30",
                 "-o", os.path.join(os.path.expanduser(j["dir"]), "%(title).150B [%(id)s].%(ext)s")]
         if j.get("audio"): args += ["-x", "--audio-format", "m4a"]
         else: args += ["-f", "bv*[height<=?%s]+ba/b" % (j.get("max_height") or 1080), "--merge-output-format", "mp4"]
@@ -156,9 +194,22 @@ def stop(j, newstate):
 
 def view(j):
     v = {k: j.get(k) for k in ("id", "name", "kind", "source", "dir", "when", "state", "created", "started", "ended", "exit_code")}
+    v["retry_count"] = int(j.get("retry_count") or 0)
+    v["max_retries"] = retry_limit(j)
+    v["next_retry_at"] = j.get("next_retry_at")
     v.update(progress(j))
     if j.get("state") == "complete": v.update(percent=100, done=v.get("total"), speed="0B/s", eta=None)
     return v
+def retry_label(v):
+    count = int(v.get("retry_count") or 0)
+    limit = v.get("max_retries")
+    if not count or limit is None: return ""
+    if v.get("state") == "retrying":
+        stamp = v.get("next_retry_at") or ""
+        hhmm = ("@" + stamp[11:16]) if len(stamp) >= 16 else ""
+        return f"retry {count}/{limit} {hhmm}".strip()
+    if v.get("state") == "failed": return f"retry {count}/{limit}"
+    return ""
 
 def all_jobs():
     os.makedirs(JOBS, exist_ok=True)
@@ -182,8 +233,14 @@ def tick():
         running = {"media": 0, "aria": 0}
         for j in jobs:
             if j["state"] == "running": running[pool_of(j)] += 1
-        # Prefer "now" jobs over "night" jobs, then older created first
-        candidates = [j for j in jobs if j["state"] in ("queued", "waiting")]
+        # Prefer "now" jobs over "night" jobs, then older created first.
+        # Due retries join the same queue; future retries stay "retrying".
+        now_ts = time.time()
+        def ready(j):
+            if j["state"] in ("queued", "waiting"): return True
+            ts = j.get("next_retry_ts")
+            return j["state"] == "retrying" and type(ts) in (int, float) and ts <= now_ts
+        candidates = [j for j in jobs if ready(j)]
         candidates.sort(key=lambda x: (0 if x.get("when") == "now" else 1, x.get("created_ts") or 0, x.get("created") or ""))
         for j in candidates:
             pool = pool_of(j)
@@ -193,6 +250,7 @@ def tick():
                 if not night:
                     if j["state"] == "queued": j["state"] = "waiting"; save(j)
                     continue
+            j["next_retry_ts"] = j["next_retry_at"] = None
             start(j)
             running[pool] += 1
 
@@ -209,7 +267,9 @@ def out(obj, as_json):
                 pr += f" peers:{v['connections']}"
         else:
             pr = ""
-        print(f"{v['id']}  {v['state']:<8} {v['when']:<5} {pr}  {v['name']}")
+        label = retry_label(v)
+        extra = f" {label}" if label else ""
+        print(f"{v['id']}  {v['state']:<8} {v['when']:<5} {pr}{extra}  {v['name']}")
 
 def collect_sources(o):
     raw = list(o.sources or [])
@@ -238,16 +298,20 @@ def add_one(raw_src, o, label=None):
     if os.path.exists(os.path.join(jdir(i), "job.json")):
         j = refresh(load(i))
         if j["state"] not in ("complete", "running"):
+            if j["state"] in ("failed", "retrying"):
+                j["retry_count"] = 0
+                j["next_retry_ts"] = j["next_retry_at"] = None
             j.update(when=o.when, dir=o.dir, limit=o.limit or j.get("limit"),
                      audio=o.audio or j.get("audio"), max_height=o.max_height or j.get("max_height"),
-                     state="queued")
+                     max_retries=o.retries, state="queued")
             save(j)
     else:
         os.makedirs(jdir(i), exist_ok=True)
         default_name = (re.search(r"dn=([^&]+)", src) or [None, src[:60]])[1] if k == "magnet" else (os.path.basename(src)[:80] or src[:80])
         j = {"id": i, "kind": k, "source": src, "dir": o.dir, "when": o.when, "limit": o.limit,
              "audio": o.audio, "max_height": o.max_height,
-             "name": label or default_name,
+             "name": label or default_name, "retry_count": 0, "max_retries": o.retries,
+             "next_retry_ts": None, "next_retry_at": None,
              "state": "queued", "created": now(), "created_ts": time.time(), "pid": None}
         if k == "torrent":
             lt = os.path.join(jdir(i), "source.torrent"); shutil.copy(src, lt); j["local_torrent"] = lt
@@ -265,6 +329,8 @@ def main():
     a.add_argument("--media", action="store_true", help="force yt-dlp for any video site URL")
     a.add_argument("--audio", action="store_true", help="media: audio only (m4a)")
     a.add_argument("--max-height", type=int, help="media: max video height, default 1080")
+    a.add_argument("--retries", type=int, default=DEFAULT_RETRIES,
+                   help="cross-process retries after a failed attempt (default %(default)s, env ARIA_DL_MAX_RETRIES; 0 disables)")
     a.add_argument("--json", action="store_true")
     l = sp.add_parser("list"); l.add_argument("--json", action="store_true")
     for c in ("status", "pause", "resume", "remove"):
@@ -273,6 +339,78 @@ def main():
     sp.add_parser("tick")
     o = ap.parse_args()
     os.makedirs(JOBS, exist_ok=True)
+    if o.cmd == "add" and o.retries < 0: sys.exit("aria-dl: --retries must be >= 0")
+    try:
+        dispatch(o)
+    finally:
+        arm_retry_wake()
+
+def saved_jobs():
+    os.makedirs(JOBS, exist_ok=True)
+    found = []
+    for i in os.listdir(JOBS):
+        p = os.path.join(jdir(i), "job.json")
+        if not os.path.isfile(p): continue
+        try:
+            with open(p) as f: found.append(json.load(f))
+        except Exception: pass
+    return found
+def next_night_open(now_ts):
+    dt = datetime.datetime.fromtimestamp(now_ts)
+    if dt.hour >= 22 or dt.hour < 8: return None
+    return dt.replace(hour=22, minute=0, second=0, microsecond=0).timestamp()
+def retry_wake_at(jobs, now_ts):
+    targets = []
+    for j in jobs:
+        if j.get("state") != "retrying": continue
+        ts = j.get("next_retry_ts")
+        if type(ts) not in (int, float): continue
+        target = ts
+        if j.get("when") == "night":
+            opening = next_night_open(now_ts)
+            if opening is not None: target = max(ts, opening)
+        if target > now_ts + 0.5: targets.append(target)
+    return min(targets) if targets else None
+def read_wake():
+    try:
+        with open(WAKE) as f: return json.load(f)
+    except Exception: return None
+def silence_wake(info):
+    pid = (info or {}).get("pid")
+    if pid and pid != os.getpid() and alive(pid):
+        try: os.killpg(pid, signal.SIGTERM)
+        except Exception: pass
+    if os.path.exists(WAKE):
+        try: os.remove(WAKE)
+        except Exception: pass
+def arm_retry_wake():
+    os.makedirs(BASE, exist_ok=True)
+    with open(LOCK, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        now_ts = time.time()
+        when = retry_wake_at(saved_jobs(), now_ts)
+        info = read_wake()
+        if info and info.get("pid") == os.getpid():
+            info = None
+            if os.path.exists(WAKE):
+                try: os.remove(WAKE)
+                except Exception: pass
+        if when is None:
+            silence_wake(info); return
+        if info and alive(info.get("pid") or 0) and type(info.get("at")) in (int, float):
+            if now_ts - 1 <= info["at"] <= when + 1: return
+            silence_wake(info)
+        delay = max(1, int(when - now_ts) + 1)
+        token = "t" + os.urandom(8).hex()
+        me = os.path.realpath(__file__)
+        p = subprocess.Popen(["/bin/sh", "-c", WAKE_SCRIPT, "wake", str(delay), WAKE, token, me],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True, env={**os.environ, "PATH": PATH})
+        tmp = WAKE + ".tmp"
+        with open(tmp, "w") as f: json.dump({"pid": p.pid, "at": when, "token": token}, f)
+        os.replace(tmp, WAKE)
+
+def dispatch(o):
     if o.cmd == "add":
         sources, from_batch = collect_sources(o)
         ids, errors = [], []
@@ -296,13 +434,20 @@ def main():
         views = [view(find(i)) for i in o.ids]
         out(views if len(views) > 1 else views[0], o.json)
     elif o.cmd == "pause":
-        targets = [j for j in all_jobs() if j["state"] in ("running", "queued", "waiting")] if o.ids == ["all"] else [find(i) for i in o.ids]
-        for j in targets: stop(j, "paused")
+        targets = [j for j in all_jobs() if j["state"] in ("running", "queued", "waiting", "retrying")] if o.ids == ["all"] else [find(i) for i in o.ids]
+        for j in targets:
+            stop(j, "paused")
+            j["next_retry_ts"] = j["next_retry_at"] = None
+            save(j)
         views = [view(j) for j in targets]
         out(views if (len(o.ids) > 1 or o.ids == ["all"]) else (views[0] if views else []), o.json)
     elif o.cmd == "resume":
-        targets = [j for j in all_jobs() if j["state"] in ("paused", "failed", "waiting")] if o.ids == ["all"] else [find(i) for i in o.ids]
-        for j in targets: j["state"] = "queued"; save(j)
+        targets = [j for j in all_jobs() if j["state"] in ("paused", "failed", "waiting", "retrying")] if o.ids == ["all"] else [find(i) for i in o.ids]
+        for j in targets:
+            if j["state"] in ("failed", "retrying"): j["retry_count"] = 0
+            j["next_retry_ts"] = j["next_retry_at"] = None
+            j["state"] = "queued"
+            save(j)
         tick()
         views = [view(refresh(load(j["id"]))) for j in targets]
         out(views if (len(o.ids) > 1 or o.ids == ["all"]) else (views[0] if views else []), o.json)

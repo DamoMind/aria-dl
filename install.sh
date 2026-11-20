@@ -39,7 +39,7 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
     <string>tick</string>
   </array>
   <key>StartInterval</key>
-  <integer>900</integer>
+  <integer>60</integer>
   <key>RunAtLoad</key>
   <true/>
   <key>EnvironmentVariables</key>
@@ -56,7 +56,7 @@ PLIST_EOF
   UID_NUM="$(id -u)"
   launchctl bootout "gui/${UID_NUM}" "$PLIST" >/dev/null 2>&1 || true
   launchctl bootstrap "gui/${UID_NUM}" "$PLIST"
-  echo "Installed LaunchAgent: com.damomind.aria-dl (runs aria-dl tick every 15 min)"
+  echo "Installed LaunchAgent: com.damomind.aria-dl (runs aria-dl tick every 60 seconds)"
 fi
 
 echo "Installed aria-dl to ${BIN_DIR}/aria-dl"
