@@ -34,7 +34,7 @@ cd aria-dl
 ./install.sh
 ```
 
-`install.sh` installs `aria-dl` to `~/.local/bin/aria-dl` (symlinking to `/usr/local/bin/aria-dl` if writable) and, on macOS, registers a LaunchAgent (`com.damomind.aria-dl`) that runs `aria-dl tick` every 60 seconds as a safety net for night windows, retries, and reboots. A pending retry also schedules one delayed `tick` at its backoff deadline, so a short wait is not pushed out to the next periodic run. On macOS, `./install.sh --cookies` also runs `aria-dl cookies refresh` in the foreground at the end.
+`install.sh` installs `aria-dl` to `~/.local/bin/aria-dl` (symlinking to `/usr/local/bin/aria-dl` if writable) and, on macOS, registers a LaunchAgent (`com.damomind.aria-dl`) that runs `aria-dl tick` every 60 seconds as a safety net for night windows, retries, and reboots. A pending retry also schedules one delayed `tick` at its backoff deadline, so a short wait is not pushed out to the next periodic run. On macOS, `./install.sh --cookies` also runs `aria-dl cookies refresh` in the foreground at the end. `./install.sh --youtube-proxy http://127.0.0.1:2081` stores that URL for aria-dl's own YouTube downloads and does not change the system proxy.
 
 ## Usage
 
@@ -137,7 +137,7 @@ Only one of `--cookies-from-browser` or `--cookies` is passed to `yt-dlp`. Cooki
 
 On macOS, Safari needs Full Disk Access for the terminal. Chrome may prompt for Keychain access once.
 
-Keep the cookies directory mode `700` and never commit cookies to git. If a media download fails with YouTube's "Sign in to confirm you're not a bot" check, the job records `last_error` as `youtube_bot_check`, retries still run, and `aria-dl status` adds `hint: set --cookies-from-browser chrome`.
+Keep the cookies directory mode `700` and never commit cookies to git. If a media download fails with YouTube's "Sign in to confirm you're not a bot" check, the job records `last_error` as `youtube_bot_check` and retries still run. `aria-dl status` suggests browser cookies and, when no proxy is configured, a local proxy.
 
 ## YouTube cookies on macOS
 
@@ -157,7 +157,24 @@ If macOS blocks the read, `cookies refresh` tells you to run it again from Termi
 
 `cookies status` reports the file path, age, cookie count, whether a login cookie is present, and the earliest expiry. It does not print names' values.
 
-When a media job fails the YouTube bot check, aria-dl tries one silent `cookies refresh` at most once per hour before the normal retry (under launchd that refresh usually fails, which is expected). If a job was started with `cookies_from_browser` and yt-dlp fails because the cookies database is blocked while that browser profile directory exists, the same attempt falls back to the cookies file instead of counting as a failure.
+When a media job fails the YouTube bot check, aria-dl tries one silent `cookies refresh` at most once per hour before the normal retry (under launchd that refresh usually fails, which is expected). Cookie export itself stays direct. The retried download uses the proxy below when one is configured. If a job was started with `cookies_from_browser` and yt-dlp fails because the cookies database is blocked while that browser profile directory exists, the same attempt falls back to the cookies file instead of counting as a failure. If no proxy is configured, `status` also suggests a local proxy.
+
+## Download proxy
+
+The proxy is an argument on the yt-dlp process aria-dl starts. It is not written into `HTTP_PROXY`, `HTTPS_PROXY`, or the macOS system proxy, so other apps stay direct.
+
+```bash
+aria-dl config set youtube_proxy http://127.0.0.1:2081   # YouTube media jobs only
+aria-dl config set proxy http://127.0.0.1:2081           # every media job
+aria-dl config get youtube_proxy
+aria-dl config unset youtube_proxy
+aria-dl add <video-url> --proxy http://127.0.0.1:2081    # this job only
+aria-dl add <video-url> --no-proxy                       # this job goes direct
+```
+
+`ARIA_DL_YOUTUBE_PROXY` and `ARIA_DL_PROXY` override the config file. A job flag overrides both. An empty value or `none` disables the proxy. Nothing is proxied until one of these is set.
+
+Before each attempt, aria-dl opens a TCP connection to the proxy host and port (2 second limit). If that fails, the attempt goes direct and the job log records `proxy unreachable, falling back to direct`. The job is not failed only because the proxy is down. `list` and `status --json` show the proxy as `host:port` with any username or password removed.
 
 ## Security & Privacy Notes
 
