@@ -50,6 +50,7 @@ aria-dl add <video-url> --max-height 720              # Cap resolution
 aria-dl add <other-video-site-url> --media            # Force yt-dlp
 aria-dl add <source> --when night                     # 22:00-08:00 & Wi-Fi only
 aria-dl add <source> --retries 5                      # cross-process retries (default); 0 disables
+aria-dl add <video-url> --cookies-from-browser chrome # browser cookies for yt-dlp
 aria-dl add <source> --dir ~/Videos --limit 2M --name "My Job"
 ```
 
@@ -72,12 +73,27 @@ pbpaste | aria-dl add --audio
 aria-dl list                       # List all jobs and progress
 aria-dl status <ID> [ID2 ...]      # Job details (ID prefix matching supported)
 aria-dl pause <ID> [ID2 ...]       # Pause one or more jobs, including retrying (or: aria-dl pause all)
-aria-dl resume <ID> [ID2 ...]      # Resume; failed/retrying jobs reset their retry counter (or: aria-dl resume all)
+aria-dl resume <ID> [ID2 ...]      # Resume; failed/retrying jobs reset their retry counter
+aria-dl resume all                 # Re-queue paused, failed, waiting, and retrying
 aria-dl log <ID> -n 50             # Tail recent download log
 aria-dl remove <ID> [ID2 ...]      # Forget job records (keeps downloaded files)
 ```
 
 Append `--json` to any command for machine-readable output (single job returns a JSON object; batch operations return a JSON array).
+
+## Bulk operations
+
+A state name selects every job in that state. Mix selectors with IDs; each job is acted on once.
+
+```bash
+aria-dl resume failed              # Re-queue every failed and retrying job, reset retry counters, tick once
+aria-dl resume paused              # Re-queue every paused job
+aria-dl resume failed <ID>         # Selector plus an explicit job
+aria-dl remove failed              # Forget failed job records; downloaded files stay
+aria-dl remove complete            # Forget completed job records; downloaded files stay
+```
+
+`resume all` still re-queues paused, failed, waiting, and retrying jobs. Text mode prints one line such as `resumed 3 jobs (failed)`. `--json` returns an array of the affected jobs. If nothing matches, the command prints `no jobs matched` and exits 0.
 
 ## Concurrency & Scheduling
 
@@ -98,19 +114,30 @@ Transient failures are retried at two levels:
 
 Each failed attempt waits longer before the next one: **2 minutes, 5 minutes, 15 minutes, 30 minutes, then 60 minutes**. Further attempts stay at 60 minutes until the cap is reached. While it is waiting, the job state is `retrying`. `aria-dl tick` starts it once `next_retry_ts` has passed, and still honors `--when night` and the concurrency caps. One background sleeper runs `aria-dl tick` at that time (a later retry replaces it only when it would fire sooner), so a 2-minute backoff does not sit idle until the next LaunchAgent run. On macOS the LaunchAgent also runs `tick` every 60 seconds as a safety net.
 
-After `retry_count` reaches `max_retries`, the job becomes `failed` and is not retried on its own. Permanently broken URLs therefore stop. `aria-dl resume` (including `resume all`) on a `failed` or `retrying` job sets `retry_count` back to `0`, clears the schedule, queues the job, and runs `tick` immediately. Adding that source again does the same for a `failed` or `retrying` job. `aria-dl pause` (including `pause all`) pauses `retrying` jobs and clears `next_retry_ts` / `next_retry_at` without resetting the counter.
+After `retry_count` reaches `max_retries`, the job becomes `failed` and is not retried on its own. Permanently broken URLs therefore stop. `aria-dl resume` on a `failed` or `retrying` job, including `resume failed` and `resume all`, sets `retry_count` back to `0`, clears the schedule, queues the job, and runs `tick` once. Adding that source again does the same for a `failed` or `retrying` job. `aria-dl pause` (including `pause all`) pauses `retrying` jobs and clears `next_retry_ts` / `next_retry_at` without resetting the counter.
 
 `list` and `status` include `retry_count`, `max_retries`, and `next_retry_at` in `--json`. The text view shows a waiting retry as `retry 1/5 @HH:MM`.
 
-## Optional Cookies for Video Sites
+## Browser cookies for video sites
 
-If you need authenticated downloads for video sites, export a Netscape-format cookies file to:
+Media jobs can pass the browser's own cookies to `yt-dlp`:
+
+```bash
+aria-dl add <video-url> --cookies-from-browser chrome
+aria-dl add <video-url> --cookies-from-browser 'chrome:Profile 1'
+```
+
+The value is stored on the job. When the flag is omitted, `aria-dl` uses `ARIA_DL_COOKIES_FROM_BROWSER`, then the `cookies_from_browser` key in `~/.local/share/aria-dl/config.json` (a missing file changes nothing). If none of those is set and this Netscape file exists, it is used instead:
 
 ```text
 ~/.local/share/aria-dl/cookies/youtube.txt
 ```
 
-Keep that directory mode `700` and never commit cookies to git. When present, `aria-dl` passes `--cookies` to `yt-dlp` automatically.
+Only one of `--cookies-from-browser` or `--cookies` is passed to `yt-dlp`. Cookie values are never printed or written into status. Status JSON may include the browser name in `cookies_from_browser`.
+
+On macOS, Safari needs Full Disk Access for the terminal. Chrome may prompt for Keychain access once.
+
+Keep the cookies directory mode `700` and never commit cookies to git. If a media download fails with YouTube's "Sign in to confirm you're not a bot" check, the job records `last_error` as `youtube_bot_check`, retries still run, and `aria-dl status` adds `hint: set --cookies-from-browser chrome`.
 
 ## Security & Privacy Notes
 

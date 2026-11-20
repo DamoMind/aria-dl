@@ -2,12 +2,12 @@
 """aria-dl: reusable downloader for torrent files, magnet links, http(s) URLs (aria2c) and video sites (yt-dlp).
 
 Usage:
-  aria-dl add SOURCE [SOURCE ...] [--file FILE] [--dir DIR] [--when now|night] [--name LABEL] [--limit RATE] [--retries N] [--media] [--audio] [--max-height N] [--json]
+  aria-dl add SOURCE [SOURCE ...] [--file FILE] [--dir DIR] [--when now|night] [--name LABEL] [--limit RATE] [--retries N] [--cookies-from-browser BROWSER[:PROFILE]] [--media] [--audio] [--max-height N] [--json]
   aria-dl list [--json]
   aria-dl status ID [ID ...] [--json]
   aria-dl pause ID [ID ...] | all [--json]
-  aria-dl resume ID [ID ...] | all [--json]
-  aria-dl remove ID [ID ...]                     (forgets jobs, never deletes downloaded files)
+  aria-dl resume ID [ID ...] | all | failed | paused [--json]
+  aria-dl remove ID [ID ...] | failed | complete [--json]
   aria-dl log ID [-n N]
   aria-dl tick                                   (LaunchAgent safety net, on job exit, and at the next retry)
 
@@ -24,6 +24,14 @@ Retries      : yt-dlp is started with --retries 5 --fragment-retries 5 --retry-s
                --retries N times (default 5, env ARIA_DL_MAX_RETRIES, 0 disables) in state
                "retrying", with backoff 2m, 5m, 15m, 30m, then 60m. One sleeper runs tick
                at the next retry time. resume of a failed or retrying job resets the counter.
+Bulk         : resume failed re-queues failed and retrying jobs. resume paused re-queues
+               paused jobs. resume all is paused, failed, waiting, and retrying.
+               remove failed / remove complete forget those job records only.
+               Selectors can be mixed with IDs and are deduplicated. Text mode prints
+               "resumed N jobs (...)" ; nothing matched prints "no jobs matched".
+Cookies      : --cookies-from-browser BROWSER[:PROFILE], else ARIA_DL_COOKIES_FROM_BROWSER,
+               else cookies_from_browser in ~/.local/share/aria-dl/config.json, else the
+               Netscape file cookies/youtube.txt. Never both --cookies and --cookies-from-browser.
 Jobs live in ~/.local/share/aria-dl/jobs/<ID>/ ; downloads resume automatically (--continue).
 """
 import argparse, fcntl, hashlib, json, os, re, signal, subprocess, sys, time, shutil, datetime
@@ -114,15 +122,44 @@ def retry_limit(j):
     return limit if type(limit) is int else DEFAULT_RETRIES
 def retry_delay(count):
     return RETRY_BACKOFFS[min(max(int(count), 1), len(RETRY_BACKOFFS)) - 1]
+def recent_log(job_id):
+    lp = os.path.join(jdir(job_id), "aria2.log")
+    try:
+        with open(lp, "rb") as f:
+            f.seek(0, 2); f.seek(max(0, f.tell() - 20000))
+            text = f.read().decode("utf-8", "ignore")
+    except OSError:
+        return ""
+    cut = text.rfind("==== start")
+    return text[cut:] if cut >= 0 else text
+def saw_bot_check(job_id):
+    text = recent_log(job_id).replace("\u2019", "'").lower()
+    return "sign in to confirm you're not a bot" in text
+def load_config():
+    path = os.path.join(BASE, "config.json")
+    try:
+        with open(path, encoding="utf-8") as f: data = json.load(f)
+    except (OSError, ValueError, UnicodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+def browser_for(j):
+    """Browser spec for yt-dlp, never cookie contents. Flag > env > config > none."""
+    for spec in (j.get("cookies_from_browser"), os.environ.get("ARIA_DL_COOKIES_FROM_BROWSER"),
+                 load_config().get("cookies_from_browser")):
+        if isinstance(spec, str) and spec.strip(): return spec.strip()
+    return None
 def mark_stopped(j, code):
     j["exit_code"] = code; j["pid"] = None; j["ended"] = now()
     if code == 0:
         j["next_retry_ts"] = j["next_retry_at"] = None
+        j["last_error"] = None
         j["state"] = "complete"
         return
     if code in (None, 7):
         j["state"] = "waiting"
         return
+    if j.get("kind") == "media" and saw_bot_check(j["id"]): j["last_error"] = "youtube_bot_check"
+    elif j.get("last_error") == "youtube_bot_check": j["last_error"] = None
     limit = retry_limit(j); count = int(j.get("retry_count") or 0); j["max_retries"] = limit
     if limit > 0 and count < limit:
         count += 1
@@ -151,7 +188,9 @@ def start(j):
         if j.get("audio"): args += ["-x", "--audio-format", "m4a"]
         else: args += ["-f", "bv*[height<=?%s]+ba/b" % (j.get("max_height") or 1080), "--merge-output-format", "mp4"]
         if j.get("limit"): args += ["-r", j["limit"]]
-        if os.path.exists(COOKIES): args += ["--cookies", COOKIES]
+        browser = browser_for(j)
+        if browser: args += ["--cookies-from-browser", browser]
+        elif os.path.exists(COOKIES): args += ["--cookies", COOKIES]
         args.append(j["source"])
         return launch(j, d, args)
     args = ["aria2c", "--continue=true", "--summary-interval=60", "--console-log-level=notice",
@@ -197,6 +236,8 @@ def view(j):
     v["retry_count"] = int(j.get("retry_count") or 0)
     v["max_retries"] = retry_limit(j)
     v["next_retry_at"] = j.get("next_retry_at")
+    v["last_error"] = j.get("last_error")
+    v["cookies_from_browser"] = browser_for(j)
     v.update(progress(j))
     if j.get("state") == "complete": v.update(percent=100, done=v.get("total"), speed="0B/s", eta=None)
     return v
@@ -254,7 +295,7 @@ def tick():
             start(j)
             running[pool] += 1
 
-def out(obj, as_json):
+def out(obj, as_json, hints=False):
     if as_json: print(json.dumps(obj, ensure_ascii=False, indent=1)); return
     rows = obj if isinstance(obj, list) else [obj]
     for v in rows:
@@ -269,7 +310,8 @@ def out(obj, as_json):
             pr = ""
         label = retry_label(v)
         extra = f" {label}" if label else ""
-        print(f"{v['id']}  {v['state']:<8} {v['when']:<5} {pr}{extra}  {v['name']}")
+        hint = "  hint: set --cookies-from-browser chrome" if hints and v.get("last_error") == "youtube_bot_check" else ""
+        print(f"{v['id']}  {v['state']:<8} {v['when']:<5} {pr}{extra}  {v['name']}{hint}")
 
 def collect_sources(o):
     raw = list(o.sources or [])
@@ -301,6 +343,8 @@ def add_one(raw_src, o, label=None):
             if j["state"] in ("failed", "retrying"):
                 j["retry_count"] = 0
                 j["next_retry_ts"] = j["next_retry_at"] = None
+            if o.cookies_from_browser and o.cookies_from_browser.strip():
+                j["cookies_from_browser"] = o.cookies_from_browser.strip()
             j.update(when=o.when, dir=o.dir, limit=o.limit or j.get("limit"),
                      audio=o.audio or j.get("audio"), max_height=o.max_height or j.get("max_height"),
                      max_retries=o.retries, state="queued")
@@ -308,10 +352,11 @@ def add_one(raw_src, o, label=None):
     else:
         os.makedirs(jdir(i), exist_ok=True)
         default_name = (re.search(r"dn=([^&]+)", src) or [None, src[:60]])[1] if k == "magnet" else (os.path.basename(src)[:80] or src[:80])
+        browser = o.cookies_from_browser.strip() if o.cookies_from_browser and o.cookies_from_browser.strip() else None
         j = {"id": i, "kind": k, "source": src, "dir": o.dir, "when": o.when, "limit": o.limit,
              "audio": o.audio, "max_height": o.max_height,
              "name": label or default_name, "retry_count": 0, "max_retries": o.retries,
-             "next_retry_ts": None, "next_retry_at": None,
+             "next_retry_ts": None, "next_retry_at": None, "cookies_from_browser": browser,
              "state": "queued", "created": now(), "created_ts": time.time(), "pid": None}
         if k == "torrent":
             lt = os.path.join(jdir(i), "source.torrent"); shutil.copy(src, lt); j["local_torrent"] = lt
@@ -331,10 +376,18 @@ def main():
     a.add_argument("--max-height", type=int, help="media: max video height, default 1080")
     a.add_argument("--retries", type=int, default=DEFAULT_RETRIES,
                    help="cross-process retries after a failed attempt (default %(default)s, env ARIA_DL_MAX_RETRIES; 0 disables)")
+    a.add_argument("--cookies-from-browser", metavar="BROWSER[:PROFILE]",
+                   help="yt-dlp browser cookies, e.g. chrome or 'chrome:Profile 1' (else env ARIA_DL_COOKIES_FROM_BROWSER, then config.json)")
     a.add_argument("--json", action="store_true")
     l = sp.add_parser("list"); l.add_argument("--json", action="store_true")
-    for c in ("status", "pause", "resume", "remove"):
+    for c in ("status", "pause"):
         p = sp.add_parser(c); p.add_argument("ids", nargs="+"); p.add_argument("--json", action="store_true")
+    r = sp.add_parser("resume")
+    r.add_argument("ids", nargs="+", help="job IDs and/or selectors: all, failed (includes retrying), paused")
+    r.add_argument("--json", action="store_true")
+    rm = sp.add_parser("remove")
+    rm.add_argument("ids", nargs="+", help="job IDs and/or selectors: failed, complete (job records only)")
+    rm.add_argument("--json", action="store_true")
     g = sp.add_parser("log"); g.add_argument("id"); g.add_argument("-n", type=int, default=20)
     sp.add_parser("tick")
     o = ap.parse_args()
@@ -410,6 +463,36 @@ def arm_retry_wake():
         with open(tmp, "w") as f: json.dump({"pid": p.pid, "at": when, "token": token}, f)
         os.replace(tmp, WAKE)
 
+RESUME_SELECTORS = {
+    "all": ("paused", "failed", "waiting", "retrying"),
+    "failed": ("failed", "retrying"),
+    "paused": ("paused",),
+}
+REMOVE_SELECTORS = {"failed": ("failed",), "complete": ("complete",)}
+def pick_targets(tokens, table):
+    jobs = all_jobs()
+    chosen, seen, labels, named = [], set(), [], False
+    for tok in tokens:
+        if tok not in labels: labels.append(tok)
+        if tok in table:
+            named = True
+            for j in jobs:
+                if j["state"] in table[tok] and j["id"] not in seen:
+                    chosen.append(j); seen.add(j["id"])
+        else:
+            j = find(tok)
+            if j["id"] not in seen:
+                chosen.append(j); seen.add(j["id"])
+    return chosen, labels, named
+def bulk_line(verb, n, labels):
+    return f"{verb} {n} {'job' if n == 1 else 'jobs'} ({', '.join(labels)})"
+def no_match(as_json):
+    print("[]" if as_json else "no jobs matched")
+def queue_resume(j):
+    if j["state"] in ("failed", "retrying"): j["retry_count"] = 0
+    j["next_retry_ts"] = j["next_retry_at"] = None
+    j["state"] = "queued"
+    save(j)
 def dispatch(o):
     if o.cmd == "add":
         sources, from_batch = collect_sources(o)
@@ -432,7 +515,7 @@ def dispatch(o):
     elif o.cmd == "list": out([view(j) for j in all_jobs()], o.json)
     elif o.cmd == "status":
         views = [view(find(i)) for i in o.ids]
-        out(views if len(views) > 1 else views[0], o.json)
+        out(views if len(views) > 1 else views[0], o.json, hints=True)
     elif o.cmd == "pause":
         targets = [j for j in all_jobs() if j["state"] in ("running", "queued", "waiting", "retrying")] if o.ids == ["all"] else [find(i) for i in o.ids]
         for j in targets:
@@ -442,20 +525,35 @@ def dispatch(o):
         views = [view(j) for j in targets]
         out(views if (len(o.ids) > 1 or o.ids == ["all"]) else (views[0] if views else []), o.json)
     elif o.cmd == "resume":
-        targets = [j for j in all_jobs() if j["state"] in ("paused", "failed", "waiting", "retrying")] if o.ids == ["all"] else [find(i) for i in o.ids]
-        for j in targets:
-            if j["state"] in ("failed", "retrying"): j["retry_count"] = 0
-            j["next_retry_ts"] = j["next_retry_at"] = None
-            j["state"] = "queued"
-            save(j)
-        tick()
-        views = [view(refresh(load(j["id"]))) for j in targets]
-        out(views if (len(o.ids) > 1 or o.ids == ["all"]) else (views[0] if views else []), o.json)
+        pure_all = o.ids == ["all"]
+        targets, labels, named = pick_targets(o.ids, RESUME_SELECTORS)
+        if not targets:
+            if named or pure_all: no_match(o.json)
+        else:
+            for j in targets: queue_resume(j)
+            tick()
+            views = [view(refresh(load(j["id"]))) for j in targets]
+            if named and not pure_all:
+                if o.json: out(views, True)
+                else: print(bulk_line("resumed", len(views), labels))
+            else:
+                out(views if (len(o.ids) > 1 or pure_all) else views[0], o.json)
     elif o.cmd == "remove":
-        for i in o.ids:
-            j = find(i); stop(j, "removed"); shutil.rmtree(jdir(j["id"]))
-            print(f"removed job {j['id']} (files kept in {j['dir']})")
-        tick()
+        targets, labels, named = pick_targets(o.ids, REMOVE_SELECTORS)
+        if named and not targets:
+            no_match(o.json)
+        else:
+            views = []
+            for j in targets:
+                stop(j, "removed"); views.append(view(j)); shutil.rmtree(jdir(j["id"]))
+                if not named and not o.json:
+                    print(f"removed job {j['id']} (files kept in {j['dir']})")
+            if targets: tick()
+            if named:
+                if o.json: out(views, True)
+                else: print(bulk_line("removed", len(views), labels))
+            elif o.json:
+                out(views if len(views) > 1 else views[0], True)
     elif o.cmd == "log":
         j = find(o.id); subprocess.run(["tail", f"-n{o.n}", os.path.join(jdir(j["id"]), "aria2.log")])
     elif o.cmd == "tick": tick()
