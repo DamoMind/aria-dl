@@ -1,17 +1,27 @@
 #!/usr/bin/env python3
-"""aria-dl: reusable downloader for torrent files, magnet links, http(s) URLs (aria2c) and video sites (yt-dlp).
+"""aria-dl: downloader for people and for AI agents.
+
+Torrents, magnet links, HTTP(S) (aria2c), and video sites (yt-dlp). Humans get a one-line status. Agents get one JSON value on stdout, documented exit codes, and `aria-dl tools` for function calling.
 
 Usage:
   aria-dl add SOURCE [SOURCE ...] [--file FILE] [--dir DIR] [--when now|night] [--name LABEL] [--limit RATE] [--retries N] [--cookies-from-browser BROWSER[:PROFILE]] [--proxy URL] [--no-proxy] [--media] [--audio] [--max-height N] [--json]
   aria-dl list [--json]
-  aria-dl status ID [ID ...] [--json]
+  aria-dl status ID [ID ...] [--wait] [--timeout SEC] [--json]
   aria-dl pause ID [ID ...] | all [--json]
   aria-dl resume ID [ID ...] | all | failed | paused [--json]
   aria-dl remove ID [ID ...] | failed | complete [--json]
-  aria-dl log ID [-n N]
+  aria-dl log ID [-n N] [--json]
   aria-dl tick                                   (LaunchAgent safety net, on job exit, and at the next retry)
   aria-dl cookies refresh [--browser auto|chrome|brave|edge|firefox|safari|vivaldi[:PROFILE]] [--json]
   aria-dl cookies status [--json]
+  aria-dl config get [KEY] [--json] | config set KEY VALUE [--json] | config unset KEY [--json]
+  aria-dl version [--json]
+  aria-dl schema                                 (output shapes and exit codes, JSON)
+  aria-dl tools [--json]                         (function-calling tool definitions, JSON)
+
+Global flags work before the command or after it: --json, --yes / --non-interactive, --version.
+ARIA_DL_JSON=1 forces JSON. ARIA_DL_YES=1 is the same as --yes. A non-TTY stdin is never prompted.
+--json prints one pretty JSON value on stdout (not JSON Lines). Progress and human errors go to stderr. jq is optional.
 
 Multiple tasks:
   - Pass several SOURCE arguments at once
@@ -43,15 +53,56 @@ Proxy        : optional yt-dlp --proxy for media jobs only. Never changes the sy
                ARIA_DL_PROXY, then config.json. "" or "none" disables. If the proxy
                port is closed, that attempt goes direct.
 Jobs live in ~/.local/share/aria-dl/jobs/<ID>/ ; downloads resume automatically (--continue).
+Same URL is the same job id (no duplicate). Re-adding a finished or running job reports that id and leaves it.
+
+Exit codes:
+  0 success (status without --wait is success whenever the id exists)
+  1 failed (bad source, partial batch, or --wait ended failed)
+  2 usage error
+  3 no unique job for that id
+  4 --wait ended with YouTube bot-check or a network error
+  5 aria2c or yt-dlp is missing (job is kept; resume after install)
+  6 --wait timed out
+  130 interrupted
+JSON never includes cookie values or proxy usernames/passwords. Proxy fields are host:port.
+`aria-dl schema` and AGENTS.md describe the fields. See README "Use with AI agents".
 """
-import argparse, fcntl, hashlib, json, os, re, signal, socket, subprocess, sys, tempfile, time, shutil, datetime
+import argparse, errno, fcntl, hashlib, json, os, re, signal, socket, subprocess, sys, tempfile, time, shutil, datetime
 from urllib.parse import urlparse
 
+VERSION = "0.5.0"
+# Distinct, stable process statuses. Plain queries stay 0 when the id exists.
+EXIT_OK = 0
+EXIT_FAIL = 1
+EXIT_USAGE = 2
+EXIT_NOT_FOUND = 3
+EXIT_NETWORK = 4
+EXIT_DEPENDENCY = 5
+EXIT_TIMEOUT = 6
+EXIT_INTERRUPTED = 130
+TERMINAL_STATES = ("complete", "failed", "removed")
+DEFAULT_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+TAKES_VALUE = {
+    "-f", "--file", "--dir", "--when", "--name", "--limit", "--max-height",
+    "--retries", "--cookies-from-browser", "--proxy", "--browser", "-n", "--timeout",
+}
+GLOBAL_JSON = False
+GLOBAL_YES = False
+OUT_JSON = False
+
+def env_on(name):
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+def data_home():
+    override = os.environ.get("ARIA_DL_HOME")
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
+    return os.path.join(os.path.expanduser("~"), ".local/share/aria-dl")
+
 HOME = os.path.expanduser("~")
-BASE = os.path.join(HOME, ".local/share/aria-dl")
+BASE = data_home()
 JOBS = os.path.join(BASE, "jobs")
 LOCK = os.path.join(BASE, ".tick.lock")
-PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 TRACKERS_URL = "https://cf.trackerslist.com/best_aria2.txt"
 MEDIA_HOSTS = re.compile(r"^https?://([\w-]+\.)*(youtube\.com|youtu\.be|bilibili\.com|b23\.tv|x\.com|twitter\.com|vimeo\.com|nicovideo\.jp|tiktok\.com|instagram\.com|soundcloud\.com)(/|$)", re.I)
 YOUTUBE_HOSTS = re.compile(r"^https?://([\w-]+\.)*(youtube\.com|youtu\.be)(/|$)", re.I)
@@ -75,6 +126,95 @@ WAKE_SCRIPT = (
 )
 
 def now(): return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def emit(obj):
+    print(json.dumps(obj, ensure_ascii=False, indent=1), flush=True)
+
+def redact(text):
+    """Drop URL userinfo and header secrets. The source URL's query string is kept."""
+    if text is None: return None
+    text = str(text)
+    text = re.sub(r"([a-zA-Z][a-zA-Z0-9+.-]*://)[^/\s:@]+:[^/\s@]+@", r"\1", text)
+    text = re.sub(r"(?i)(^|[\s;])((?:cookie|authorization)\s*[:=]\s*)\S+", r"\1\2[redacted]", text)
+    return text
+
+def fail(code, error, message, hint=None):
+    message = redact(message)
+    if hint: hint = redact(hint)
+    if OUT_JSON or GLOBAL_JSON or env_on("ARIA_DL_JSON"):
+        payload = {"ok": False, "error": error, "message": message}
+        if hint: payload["hint"] = hint
+        emit(payload)
+    print("aria-dl: " + message, file=sys.stderr)
+    if hint: print(hint, file=sys.stderr)
+    sys.exit(code)
+
+def tool_path():
+    if "ARIA_DL_PATH" in os.environ:
+        base = os.environ.get("ARIA_DL_PATH") or ""
+    else:
+        base = DEFAULT_PATH
+    parts = []
+    for chunk in (base, os.environ.get("PATH", "")):
+        for p in chunk.split(os.pathsep):
+            if p and p not in parts: parts.append(p)
+    return os.pathsep.join(parts)
+
+def child_env():
+    """Prefer known tool locations, then the caller PATH. Do not set proxy variables."""
+    return {**os.environ, "PATH": tool_path()}
+
+def tool_ok(name):
+    return shutil.which(name, path=child_env()["PATH"]) is not None
+
+def parse_size(text):
+    if text is None: return None
+    m = re.match(r"^\s*([\d.]+)\s*([kmgtp]?i?b)?\s*$", str(text), re.I)
+    if not m: return None
+    try: num = float(m.group(1))
+    except ValueError: return None
+    unit = (m.group(2) or "b").lower()
+    mult = {
+        "b": 1,
+        "kb": 1000, "mb": 1000 ** 2, "gb": 1000 ** 3, "tb": 1000 ** 4,
+        "kib": 1024, "mib": 1024 ** 2, "gib": 1024 ** 3, "tib": 1024 ** 4,
+    }
+    if unit not in mult: return None
+    return int(num * mult[unit])
+
+def blank_progress():
+    return {
+        "percent": None, "done": None, "total": None,
+        "done_bytes": None, "total_bytes": None,
+        "speed": None, "eta": None, "connections": None, "seeds": None,
+    }
+
+def fill_bytes(p):
+    done_b = parse_size(p.get("done")) if p.get("done") else None
+    total_b = parse_size(p.get("total")) if p.get("total") else None
+    if done_b is None and total_b is not None and isinstance(p.get("percent"), int):
+        done_b = int(total_b * (p["percent"] / 100.0))
+    p["done_bytes"] = done_b
+    p["total_bytes"] = total_b
+    return p
+
+DEST_RES = (
+    re.compile(r"\[download\] Destination: (.+)$"),
+    re.compile(r"\[ExtractAudio\] Destination: (.+)$"),
+    re.compile(r'\[Merger\] Merging formats into "(.+)"'),
+    re.compile(r'\[MoveFiles\] Moving file ".+" to "(.+)"'),
+    re.compile(r"^Download complete: (.+)$"),
+)
+NET_MARKERS = (
+    "network is unreachable",
+    "connection reset",
+    "temporary failure in name resolution",
+    "name or service not known",
+    "no route to host",
+    "connection refused",
+    "timed out",
+    "unable to download api page",
+)
 def jdir(i): return os.path.join(JOBS, i)
 def load(i):
     with open(os.path.join(jdir(i), "job.json")) as f: return json.load(f)
@@ -148,6 +288,20 @@ def recent_log(job_id):
 def saw_bot_check(job_id):
     text = recent_log(job_id).replace("\u2019", "'").lower()
     return "sign in to confirm you're not a bot" in text
+def saw_network(job_id):
+    text = recent_log(job_id).lower()
+    return any(m in text for m in NET_MARKERS)
+def output_paths(job_id):
+    found = []
+    for line in recent_log(job_id).splitlines():
+        line = line.strip()
+        for pat in DEST_RES:
+            m = pat.search(line)
+            if not m: continue
+            path = redact(m.group(1).strip().strip('"'))
+            if path and path not in found: found.append(path)
+            break
+    return found
 def load_config():
     path = os.path.join(BASE, "config.json")
     try:
@@ -214,13 +368,6 @@ def proxy_reachable(url, timeout=2):
             return True
     except OSError:
         return False
-def child_env():
-    """Prefer known tool locations, then the caller PATH. Do not set proxy variables."""
-    parts = []
-    for chunk in (PATH, os.environ.get("PATH", "")):
-        for p in chunk.split(os.pathsep):
-            if p and p not in parts: parts.append(p)
-    return {**os.environ, "PATH": os.pathsep.join(parts)}
 BROWSERS = ("chrome", "brave", "edge", "firefox", "safari", "vivaldi")
 LOGIN_COOKIE_NAMES = ("SAPISID", "__Secure-3PSID", "LOGIN_INFO")
 COOKIE_REFRESH_STAMP = os.path.join(BASE, ".cookies-refresh-ts")
@@ -303,7 +450,8 @@ def write_cookie_file(text):
         except OSError: pass
         raise
 def run_cmd(args):
-    return subprocess.run(args, capture_output=True, text=True, env={**os.environ, "PATH": PATH})
+    path = os.environ["ARIA_DL_PATH"] if "ARIA_DL_PATH" in os.environ else DEFAULT_PATH
+    return subprocess.run(args, capture_output=True, text=True, env={**os.environ, "PATH": path})
 def export_browser(spec):
     parent = os.path.join(BASE, "cookies")
     os.makedirs(parent, mode=0o700, exist_ok=True)
@@ -376,9 +524,11 @@ def emit_refresh(result, as_json):
 def cookies_status():
     link = os.path.islink(COOKIES)
     path = cookies_write_path() if link else COOKIES
-    info = {"path": path, "exists": False, "mtime": None, "age_seconds": None, "cookie_count": 0, "login": False, "earliest_expiry": None}
+    info = {"path": path, "exists": False, "mtime": None, "age_seconds": None, "cookie_count": 0, "login": False, "earliest_expiry": None, "hint": None}
     target = path if os.path.isfile(path) else None
-    if not target: return info
+    if not target:
+        info["hint"] = cookie_hint(info)
+        return info
     st = os.stat(target)
     info.update(exists=True, path=target, mtime=datetime.datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
                 age_seconds=max(0, int(time.time() - st.st_mtime)))
@@ -389,7 +539,14 @@ def cookies_status():
     info["login"] = login_present(rows)
     exps = [r["expiry"] for r in rows if r["expiry"] > 0]
     if exps: info["earliest_expiry"] = datetime.datetime.fromtimestamp(min(exps)).strftime("%Y-%m-%d %H:%M:%S")
+    info["hint"] = cookie_hint(info)
     return info
+def cookie_hint(info):
+    if not info.get("exists"):
+        return "No cookies file yet. Run `aria-dl cookies refresh` in a terminal. macOS background jobs cannot read the browser."
+    if not info.get("login"):
+        return "No YouTube login cookie in the file. Run `aria-dl cookies refresh` from a terminal where you are signed in."
+    return None
 def format_age(secs):
     if secs < 60: return "%ds" % secs
     if secs < 3600: return "%dm" % (secs // 60)
@@ -435,7 +592,10 @@ def mark_stopped(j, code):
     if j.get("kind") == "media" and saw_bot_check(j["id"]):
         j["last_error"] = "youtube_bot_check"
         maybe_refresh_cookies()
-    elif j.get("last_error") == "youtube_bot_check": j["last_error"] = None
+    elif saw_network(j["id"]):
+        j["last_error"] = "network"
+    elif j.get("last_error") in ("youtube_bot_check", "network"):
+        j["last_error"] = None
     limit = retry_limit(j); count = int(j.get("retry_count") or 0); j["max_retries"] = limit
     if limit > 0 and count < limit:
         count += 1
@@ -453,7 +613,17 @@ def refresh(j):
             mark_stopped(j, code); save(j)
     return j
 
+def mark_dependency(j, tool):
+    j.update(state="failed", pid=None, ended=now(), exit_code=None,
+             last_error="dependency_missing", missing_tool=tool,
+             next_retry_ts=None, next_retry_at=None)
+    save(j)
+
 def start(j):
+    need = "yt-dlp" if j["kind"] == "media" else "aria2c"
+    if not tool_ok(need):
+        mark_dependency(j, need)
+        return
     d = jdir(j["id"]); os.makedirs(os.path.expanduser(j["dir"]), exist_ok=True)
     ec = os.path.join(d, "exitcode")
     if os.path.exists(ec): os.remove(ec)
@@ -501,8 +671,17 @@ def launch(j, d, args):
     log.write(f"\n==== start {now()} ====\n"); log.flush()
     me = os.path.realpath(__file__)
     script = 'd="$1"; me="$2"; shift 2; cd "$d"; "$@"; rc=$?; echo $rc > exitcode.tmp && mv exitcode.tmp exitcode; "$me" tick >/dev/null 2>&1 || true; exit $rc'
-    p = subprocess.Popen(["/bin/sh", "-c", script, "sh", d, me] + args, stdout=log, stderr=log,
-                         stdin=subprocess.DEVNULL, start_new_session=True, env=child_env())
+    try:
+        p = subprocess.Popen(["/bin/sh", "-c", script, "sh", d, me] + args, stdout=log, stderr=log,
+                             stdin=subprocess.DEVNULL, start_new_session=True, env=child_env())
+    except OSError as e:
+        log.write("failed to start %s\n" % args[0]); log.close()
+        if e.errno == errno.ENOENT: mark_dependency(j, args[0])
+        else:
+            j.update(state="failed", pid=None, ended=now(), exit_code=None, last_error="failed",
+                     next_retry_ts=None, next_retry_at=None)
+            save(j)
+        return
     j.update(state="running", pid=p.pid, started=now()); save(j)
 
 def stop(j, newstate):
@@ -520,17 +699,58 @@ def stop(j, newstate):
 
 def view(j):
     v = {k: j.get(k) for k in ("id", "name", "kind", "source", "dir", "when", "state", "created", "started", "ended", "exit_code")}
+    shown = redact(j.get("source") or "")
+    v["source"] = shown or None
+    v["name"] = redact(j.get("name")) if j.get("name") else j.get("name")
+    v["url"] = shown if shown.startswith("magnet:") or re.match(r"^[a-z][a-z0-9+.-]*://", shown, re.I) else None
     v["retry_count"] = int(j.get("retry_count") or 0)
     v["max_retries"] = retry_limit(j)
     v["next_retry_at"] = j.get("next_retry_at")
     v["last_error"] = j.get("last_error")
+    v["missing_tool"] = j.get("missing_tool")
     v["cookies_from_browser"] = browser_for(j)
-    if "proxy_used" in j: v["proxy"] = j.get("proxy_used") or None
-    else: v["proxy"] = proxy_hostport(resolved_proxy(j))
+    raw_proxy = j.get("proxy_used") if "proxy_used" in j else resolved_proxy(j)
+    v["proxy"] = proxy_hostport(raw_proxy) if raw_proxy else None
     v["proxy_configured"] = bool(resolved_proxy(j))
-    v.update(progress(j))
-    if j.get("state") == "complete": v.update(percent=100, done=v.get("total"), speed="0B/s", eta=None)
+    prog = blank_progress()
+    prog.update(progress(j))
+    if j.get("state") == "complete":
+        prog["percent"] = 100
+        if prog.get("total"): prog["done"] = prog["total"]
+        prog["speed"] = "0B/s"
+        prog["eta"] = None
+    fill_bytes(prog)
+    v.update(prog)
+    v["progress"] = dict(prog)
+    v["bytes"] = {"done": prog.get("done_bytes"), "total": prog.get("total_bytes")}
+    v["output_paths"] = output_paths(j["id"])
+    v["hint"] = job_hint(v)
     return v
+def job_hint(v):
+    state = v.get("state")
+    err = v.get("last_error")
+    jid = v.get("id") or ""
+    if err == "youtube_bot_check":
+        extra = ""
+        if not v.get("proxy_configured"):
+            extra = " Or set a yt-dlp proxy: aria-dl config set youtube_proxy http://127.0.0.1:PORT"
+        return "YouTube asked for a sign-in. Run `aria-dl cookies refresh` in a terminal." + extra
+    if err == "dependency_missing":
+        tool = v.get("missing_tool") or "aria2c or yt-dlp"
+        return "Missing %s. Install it, then `aria-dl resume %s`." % (tool, jid)
+    if err == "network":
+        return "Network error. Remaining attempts retry on their own; otherwise `aria-dl resume %s`." % jid
+    if state == "failed":
+        return "Failed. Read `aria-dl log %s`, then `aria-dl resume %s`." % (jid, jid)
+    if state == "retrying":
+        return "Retry scheduled at %s." % (v.get("next_retry_at") or "the scheduled time")
+    if state == "waiting":
+        return "Waiting for the night window (22:00-08:00) on Wi-Fi."
+    if state == "paused":
+        return "Paused. `aria-dl resume %s` continues it." % jid
+    if state == "queued":
+        return "Queued until a download slot is free."
+    return None
 def retry_label(v):
     count = int(v.get("retry_count") or 0)
     limit = v.get("max_retries")
@@ -548,8 +768,10 @@ def all_jobs():
 
 def find(i):
     ms = [x for x in os.listdir(JOBS) if x.startswith(i)] if os.path.isdir(JOBS) else []
-    if len(ms) != 1: sys.exit(f"aria-dl: no unique job matching {i}")
-    return refresh(load(ms[0]))
+    if len(ms) == 1: return refresh(load(ms[0]))
+    if len(ms) == 0:
+        fail(EXIT_NOT_FOUND, "not_found", "no job matching %s" % i, "Run aria-dl list to see ids.")
+    fail(EXIT_NOT_FOUND, "not_found", "no unique job matching %s (%d matches)" % (i, len(ms)), "Pass a longer id prefix.")
 
 def tick():
     os.makedirs(BASE, exist_ok=True)
@@ -585,28 +807,66 @@ def tick():
             start(j)
             running[pool] += 1
 
+def format_job_line(v, hints=False):
+    if v.get("percent") is not None:
+        if v.get("done") is not None:
+            pr = f"{v['percent']}% {v['done']}/{v.get('total','?')} {v.get('speed','')}"
+        else:
+            pr = f"{v['percent']}% {v.get('total','?')} {v.get('speed','')}"
+        if v.get("connections") is not None:
+            pr += f" peers:{v['connections']}"
+    else:
+        pr = ""
+    label = retry_label(v)
+    extra = f" {label}" if label else ""
+    hint = ""
+    if hints and v.get("last_error") == "youtube_bot_check":
+        hint = "  hint: set --cookies-from-browser chrome"
+        if not v.get("proxy_configured"):
+            hint += "; or a local proxy: aria-dl config set youtube_proxy http://127.0.0.1:2081"
+    shown = (" proxy:" + v["proxy"]) if v.get("proxy") else ""
+    return f"{v['id']}  {v['state']:<8} {v['when']:<5} {pr}{extra}{shown}  {v['name']}{hint}"
+
 def out(obj, as_json, hints=False):
-    if as_json: print(json.dumps(obj, ensure_ascii=False, indent=1)); return
+    if as_json:
+        emit(obj); return
     rows = obj if isinstance(obj, list) else [obj]
     for v in rows:
-        if v.get("percent") is not None:
-            if v.get("done") is not None:
-                pr = f"{v['percent']}% {v['done']}/{v.get('total','?')} {v.get('speed','')}"
-            else:
-                pr = f"{v['percent']}% {v.get('total','?')} {v.get('speed','')}"
-            if v.get("connections") is not None:
-                pr += f" peers:{v['connections']}"
-        else:
-            pr = ""
-        label = retry_label(v)
-        extra = f" {label}" if label else ""
-        hint = ""
-        if hints and v.get("last_error") == "youtube_bot_check":
-            hint = "  hint: set --cookies-from-browser chrome"
-            if not v.get("proxy_configured"):
-                hint += "; or a local proxy: aria-dl config set youtube_proxy http://127.0.0.1:2081"
-        shown = (" proxy:" + v["proxy"]) if v.get("proxy") else ""
-        print(f"{v['id']}  {v['state']:<8} {v['when']:<5} {pr}{extra}{shown}  {v['name']}{hint}")
+        print(format_job_line(v, hints=hints))
+
+def exit_for_job(v):
+    if v.get("timed_out"): return EXIT_TIMEOUT
+    if v.get("state") == "complete": return EXIT_OK
+    err = v.get("last_error")
+    if err in ("youtube_bot_check", "network"): return EXIT_NETWORK
+    if err == "dependency_missing": return EXIT_DEPENDENCY
+    if v.get("state") == "failed": return EXIT_FAIL
+    return EXIT_OK
+
+def wait_for(job_id, timeout):
+    """Block until complete, failed, or removed. Progress lines go to stderr."""
+    deadline = None if timeout is None else time.monotonic() + float(timeout)
+    last = None
+    while True:
+        tick()
+        try:
+            j = refresh(load(job_id))
+        except (OSError, ValueError):
+            fail(EXIT_NOT_FOUND, "not_found", "job %s disappeared while waiting" % job_id, "It may have been removed.")
+        v = view(j)
+        v["timed_out"] = False
+        if v.get("state") in TERMINAL_STATES:
+            return v
+        if deadline is not None and time.monotonic() >= deadline:
+            shown = int(timeout) if float(timeout) == int(float(timeout)) else timeout
+            v["timed_out"] = True
+            v["hint"] = "Timed out after %ss; job is still %s. Resume polling: aria-dl status %s --wait" % (shown, v.get("state"), job_id)
+            return v
+        sig = (v.get("state"), v.get("percent"), v.get("retry_count"), v.get("last_error"))
+        if sig != last:
+            print(format_job_line(v, hints=False), file=sys.stderr, flush=True)
+            last = sig
+        time.sleep(0.4)
 
 def collect_sources(o):
     raw = list(o.sources or [])
@@ -625,49 +885,68 @@ def collect_sources(o):
         if s not in seen:
             seen.add(s); sources.append(s)
     if not sources:
-        sys.exit("aria-dl: no sources provided (pass URLs/files, --file FILE, or pipe via stdin)")
+        fail(EXIT_USAGE, "usage", "no sources provided (pass URLs/files, --file FILE, or pipe via stdin)",
+             "Example: aria-dl add https://example.com/file.zip --json")
     return sources, from_batch
 
 def add_one(raw_src, o, label=None):
+    """Return (id, action). action is created, requeued, or exists. The id is sha1(source)[:8]."""
     k = kind_of(raw_src, o.media)
     src = os.path.abspath(os.path.expanduser(raw_src)) if k == "torrent" else raw_src
     i = hashlib.sha1(src.encode()).hexdigest()[:8]
     if os.path.exists(os.path.join(jdir(i), "job.json")):
         j = refresh(load(i))
-        if j["state"] not in ("complete", "running"):
-            if j["state"] in ("failed", "retrying"):
-                j["retry_count"] = 0
-                j["next_retry_ts"] = j["next_retry_at"] = None
-            if o.cookies_from_browser and o.cookies_from_browser.strip():
-                j["cookies_from_browser"] = o.cookies_from_browser.strip()
-            if o.no_proxy: j["proxy"] = "none"
-            elif o.proxy is not None: j["proxy"] = o.proxy.strip()
-            j.update(when=o.when, dir=o.dir, limit=o.limit or j.get("limit"),
-                     audio=o.audio or j.get("audio"), max_height=o.max_height or j.get("max_height"),
-                     max_retries=o.retries, state="queued")
-            save(j)
-    else:
-        os.makedirs(jdir(i), exist_ok=True)
-        default_name = (re.search(r"dn=([^&]+)", src) or [None, src[:60]])[1] if k == "magnet" else (os.path.basename(src)[:80] or src[:80])
-        browser = o.cookies_from_browser.strip() if o.cookies_from_browser and o.cookies_from_browser.strip() else None
-        if o.no_proxy: proxy_val = "none"
-        elif o.proxy is not None: proxy_val = o.proxy.strip()
-        else: proxy_val = None
-        j = {"id": i, "kind": k, "source": src, "dir": o.dir, "when": o.when, "limit": o.limit,
-             "audio": o.audio, "max_height": o.max_height,
-             "name": label or default_name, "retry_count": 0, "max_retries": o.retries,
-             "next_retry_ts": None, "next_retry_at": None, "cookies_from_browser": browser,
-             "proxy": proxy_val,
-             "state": "queued", "created": now(), "created_ts": time.time(), "pid": None}
-        if k == "torrent":
-            lt = os.path.join(jdir(i), "source.torrent"); shutil.copy(src, lt); j["local_torrent"] = lt
+        if j["state"] in ("complete", "running"):
+            return j["id"], "exists"
+        if j["state"] in ("failed", "retrying"):
+            j["retry_count"] = 0
+            j["next_retry_ts"] = j["next_retry_at"] = None
+        if o.cookies_from_browser and o.cookies_from_browser.strip():
+            j["cookies_from_browser"] = o.cookies_from_browser.strip()
+        if o.no_proxy: j["proxy"] = "none"
+        elif o.proxy is not None: j["proxy"] = o.proxy.strip()
+        j.update(when=o.when, dir=o.dir, limit=o.limit or j.get("limit"),
+                 audio=o.audio or j.get("audio"), max_height=o.max_height or j.get("max_height"),
+                 max_retries=o.retries, state="queued")
         save(j)
-    return j["id"]
+        return j["id"], "requeued"
+    os.makedirs(jdir(i), exist_ok=True)
+    default_name = (re.search(r"dn=([^&]+)", src) or [None, src[:60]])[1] if k == "magnet" else (os.path.basename(src)[:80] or src[:80])
+    browser = o.cookies_from_browser.strip() if o.cookies_from_browser and o.cookies_from_browser.strip() else None
+    if o.no_proxy: proxy_val = "none"
+    elif o.proxy is not None: proxy_val = o.proxy.strip()
+    else: proxy_val = None
+    j = {"id": i, "kind": k, "source": src, "dir": o.dir, "when": o.when, "limit": o.limit,
+         "audio": o.audio, "max_height": o.max_height,
+         "name": label or default_name, "retry_count": 0, "max_retries": o.retries,
+         "next_retry_ts": None, "next_retry_at": None, "cookies_from_browser": browser,
+         "proxy": proxy_val,
+         "state": "queued", "created": now(), "created_ts": time.time(), "pid": None}
+    if k == "torrent":
+        lt = os.path.join(jdir(i), "source.torrent"); shutil.copy(src, lt); j["local_torrent"] = lt
+    save(j)
+    return j["id"], "created"
 
-def main():
-    ap = argparse.ArgumentParser(prog="aria-dl", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    sp = ap.add_subparsers(dest="cmd", required=True)
-    a = sp.add_parser("add")
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        if GLOBAL_JSON or env_on("ARIA_DL_JSON"):
+            emit({"ok": False, "error": "usage", "message": message, "hint": "Run aria-dl --help"})
+        self.print_usage(sys.stderr)
+        self.exit(EXIT_USAGE, "aria-dl: %s\n" % message)
+
+def common_parser():
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("--json", action="store_true", help="one JSON value on stdout; logs on stderr (or ARIA_DL_JSON=1)")
+    p.add_argument("-y", "--yes", "--non-interactive", action="store_true", dest="yes",
+                   help="never prompt (this is already the case when stdin is not a TTY)")
+    return p
+
+def build_parser():
+    common = common_parser()
+    ap = Parser(prog="aria-dl", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--version", action="version", version="aria-dl %s" % VERSION)
+    sp = ap.add_subparsers(dest="cmd", required=True, parser_class=Parser)
+    a = sp.add_parser("add", parents=[common], help="queue downloads; the same URL returns the existing job id")
     a.add_argument("sources", nargs="*", help="one or more .torrent paths, magnet links, or URLs")
     a.add_argument("-f", "--file", help="read sources from file (one per line, - for stdin)")
     a.add_argument("--dir", default="~/Downloads")
@@ -678,41 +957,265 @@ def main():
     a.add_argument("--retries", type=int, default=DEFAULT_RETRIES,
                    help="cross-process retries after a failed attempt (default %(default)s, env ARIA_DL_MAX_RETRIES; 0 disables)")
     a.add_argument("--cookies-from-browser", metavar="BROWSER[:PROFILE]",
-                   help="yt-dlp browser cookies, e.g. chrome or 'chrome:Profile 1' (else env ARIA_DL_COOKIES_FROM_BROWSER, then config.json)")
-    a.add_argument("--proxy", help="yt-dlp proxy URL for this job only; does not change the system proxy")
+                   help="yt-dlp browser name, e.g. chrome or 'chrome:Profile 1' (never cookie values)")
+    a.add_argument("--proxy", help="yt-dlp proxy URL for this media job only; does not change the system proxy")
     a.add_argument("--no-proxy", action="store_true", help="do not use a proxy for this job")
-    a.add_argument("--json", action="store_true")
-    l = sp.add_parser("list"); l.add_argument("--json", action="store_true")
-    for c in ("status", "pause"):
-        p = sp.add_parser(c); p.add_argument("ids", nargs="+"); p.add_argument("--json", action="store_true")
-    r = sp.add_parser("resume")
-    r.add_argument("ids", nargs="+", help="job IDs and/or selectors: all, failed (includes retrying), paused")
-    r.add_argument("--json", action="store_true")
-    rm = sp.add_parser("remove")
-    rm.add_argument("ids", nargs="+", help="job IDs and/or selectors: failed, complete (job records only)")
-    rm.add_argument("--json", action="store_true")
-    g = sp.add_parser("log"); g.add_argument("id"); g.add_argument("-n", type=int, default=20)
-    ck = sp.add_parser("cookies")
-    csp = ck.add_subparsers(dest="cookies_cmd", required=True)
-    rf = csp.add_parser("refresh")
+    sp.add_parser("list", parents=[common], help="list jobs")
+    stt = sp.add_parser("status", parents=[common], help="show jobs; --wait blocks until complete or failed")
+    stt.add_argument("ids", nargs="+")
+    stt.add_argument("--wait", action="store_true", help="block until complete or failed")
+    stt.add_argument("--timeout", type=float, help="seconds to wait (0 checks once). Implies --wait")
+    pa = sp.add_parser("pause", parents=[common], help="pause jobs, or all")
+    pa.add_argument("ids", nargs="+")
+    r = sp.add_parser("resume", parents=[common], help="resume ids and/or all, failed, paused")
+    r.add_argument("ids", nargs="+", help="job ids and/or selectors: all, failed (includes retrying), paused")
+    rm = sp.add_parser("remove", parents=[common], help="forget job records; downloaded files stay")
+    rm.add_argument("ids", nargs="+", help="job ids and/or selectors: failed, complete")
+    g = sp.add_parser("log", parents=[common], help="show a job log with secrets redacted")
+    g.add_argument("id"); g.add_argument("-n", type=int, default=20)
+    ck = sp.add_parser("cookies", help="import or inspect the YouTube cookie file")
+    csp = ck.add_subparsers(dest="cookies_cmd", required=True, parser_class=Parser)
+    rf = csp.add_parser("refresh", parents=[common], help="copy YouTube cookies from a browser into the local file")
     rf.add_argument("--browser", help="auto (default) or chrome|brave|edge|firefox|safari|vivaldi, optional :PROFILE")
-    rf.add_argument("--json", action="store_true")
-    st = csp.add_parser("status")
-    st.add_argument("--json", action="store_true")
-    cf = sp.add_parser("config")
-    fsp = cf.add_subparsers(dest="config_cmd", required=True)
-    fs = fsp.add_parser("set"); fs.add_argument("key"); fs.add_argument("value")
-    fg = fsp.add_parser("get"); fg.add_argument("key", nargs="?")
-    fu = fsp.add_parser("unset"); fu.add_argument("key")
-    sp.add_parser("tick")
-    o = ap.parse_args()
+    csp.add_parser("status", parents=[common], help="cookie file age and counts; values are never printed")
+    cf = sp.add_parser("config", help="get or set youtube_proxy, proxy, cookies_from_browser")
+    fsp = cf.add_subparsers(dest="config_cmd", required=True, parser_class=Parser)
+    fs = fsp.add_parser("set", parents=[common], help="set a key; proxy credentials are stored locally and not printed back")
+    fs.add_argument("key"); fs.add_argument("value")
+    fg = fsp.add_parser("get", parents=[common], help="print one key, or all keys")
+    fg.add_argument("key", nargs="?")
+    fu = fsp.add_parser("unset", parents=[common], help="remove a key")
+    fu.add_argument("key")
+    sp.add_parser("tick", parents=[common], help="start queued jobs (used by the scheduler)")
+    sp.add_parser("version", parents=[common], help="version and whether aria2c, yt-dlp, and ffmpeg are on PATH")
+    sp.add_parser("schema", parents=[common], help="JSON schema for results and exit codes")
+    sp.add_parser("tools", parents=[common], help="JSON tool definitions for function calling or an MCP wrapper")
+    return ap
+
+def preprocess(argv):
+    """Accept --json / --yes before the subcommand or anywhere they are flags."""
+    global GLOBAL_JSON, GLOBAL_YES
+    GLOBAL_JSON = False
+    GLOBAL_YES = False
+    out = [argv[0]]
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a == "--":
+            out.extend(argv[i:]); break
+        if out[-1] in TAKES_VALUE:
+            out.append(a); i += 1; continue
+        if a == "--json":
+            GLOBAL_JSON = True; i += 1; continue
+        if a in ("-y", "--yes", "--non-interactive"):
+            GLOBAL_YES = True; i += 1; continue
+        out.append(a); i += 1
+    return out
+
+def _obj_schema(properties, required):
+    return {"type": "object", "additionalProperties": False, "properties": properties, "required": required}
+
+def _str(desc): return {"type": "string", "description": desc}
+def _int(desc): return {"type": "integer", "description": desc}
+def _bool(desc): return {"type": "boolean", "description": desc}
+def _strs(desc): return {"type": "array", "items": {"type": "string"}, "description": desc}
+
+def _tool(name, description, properties, required, argv, positionals=None, flags=None):
+    schema = _obj_schema(properties, required)
+    return {
+        "name": name,
+        "description": description,
+        "parameters": schema,
+        "input_schema": schema,
+        "aria_dl": {"argv": argv, "positionals": positionals or [], "flags": flags or {}},
+    }
+
+def tool_list():
+    return [
+        _tool("add", "Queue downloads (torrent, magnet, http(s), or video). The same URL returns the existing job id and does not create a duplicate.",
+              {"sources": _strs("Torrent paths, magnet links, or URLs."),
+               "file": _str("Text file of sources, one per line, or - for stdin."),
+               "dir": _str("Download directory. Default ~/Downloads."),
+               "when": {"type": "string", "enum": ["now", "night"], "description": "now starts immediately. night waits for 22:00-08:00 on Wi-Fi."},
+               "name": _str("Label stored on the job."),
+               "limit": _str("Rate limit passed through to aria2c or yt-dlp, for example 2M."),
+               "retries": _int("Cross-process retries after a failed attempt. 0 disables. Default 5."),
+               "media": _bool("Force yt-dlp for this URL."),
+               "audio": _bool("With media jobs, keep audio only (m4a)."),
+               "max_height": _int("Max video height for media jobs. Default 1080."),
+               "cookies_from_browser": _str("Browser name for yt-dlp, such as chrome. Never pass cookie values."),
+               "proxy": _str("yt-dlp proxy for this job only. Output shows host:port, never userinfo."),
+               "no_proxy": _bool("Force this job to go direct.")},
+              [], ["add"], ["sources"],
+              {"file": "--file", "dir": "--dir", "when": "--when", "name": "--name", "limit": "--limit",
+               "retries": "--retries", "media": "--media", "audio": "--audio", "max_height": "--max-height",
+               "cookies_from_browser": "--cookies-from-browser", "proxy": "--proxy", "no_proxy": "--no-proxy"}),
+        _tool("list", "List every job. Returns a JSON array, empty when there are none.", {}, [], ["list"]),
+        _tool("status", "Show jobs. One id returns an object; several return an array. Add wait to block until complete or failed and use the process exit code.",
+              {"ids": _strs("Job ids or unique prefixes."),
+               "wait": _bool("Block until complete or failed."),
+               "timeout": {"type": "number", "minimum": 0, "description": "Seconds to wait. 0 checks once. Omit to wait without a limit."}},
+              ["ids"], ["status"], ["ids"], {"wait": "--wait", "timeout": "--timeout"}),
+        _tool("pause", "Pause running, queued, waiting, or retrying jobs. Pass all to pause every one of those.",
+              {"ids": _strs("Job ids, or the selector all.")}, ["ids"], ["pause"], ["ids"]),
+        _tool("resume", "Queue jobs again. failed includes retrying. all is paused, failed, waiting, and retrying. Resets the retry counter on failed and retrying jobs.",
+              {"ids": _strs("Job ids and/or selectors all, failed, paused.")}, ["ids"], ["resume"], ["ids"]),
+        _tool("remove", "Forget job records. Downloaded files are kept. Selectors: failed, complete.",
+              {"ids": _strs("Job ids and/or selectors failed, complete.")}, ["ids"], ["remove"], ["ids"]),
+        _tool("log", "Recent log lines for one job. URL userinfo and cookie headers are redacted.",
+              {"id": _str("Job id or unique prefix."), "lines": _int("How many trailing lines. Default 20.")},
+              ["id"], ["log"], ["id"], {"lines": "-n"}),
+        _tool("config_get", "Read config. Proxy values are host:port or null. Omit key to read every key.",
+              {"key": {"type": "string", "enum": list(CONFIG_KEYS), "description": "Config key. Omit for all."}},
+              [], ["config", "get"], ["key"]),
+        _tool("config_set", "Set a config key. A proxy URL may include credentials; they are stored mode 0600 and never printed.",
+              {"key": {"type": "string", "enum": list(CONFIG_KEYS)}, "value": _str("New value. none or empty disables a proxy.")},
+              ["key", "value"], ["config", "set"], ["key", "value"]),
+        _tool("config_unset", "Remove a config key.",
+              {"key": {"type": "string", "enum": list(CONFIG_KEYS)}}, ["key"], ["config", "unset"], ["key"]),
+        _tool("cookies_status", "Report the YouTube cookie file age, count, and whether a login cookie is present. Values are never printed.",
+              {}, [], ["cookies", "status"]),
+        _tool("cookies_refresh", "Import YouTube and Google cookies from a local browser into the cookie file. May raise an operating-system permission dialog. Does not print cookie values.",
+              {"browser": _str("auto, or chrome, brave, edge, firefox, safari, vivaldi, with an optional :PROFILE.")},
+              [], ["cookies", "refresh"], [], {"browser": "--browser"}),
+        _tool("version", "Version, Python, and whether aria2c, yt-dlp, and ffmpeg are on PATH.", {}, [], ["version"]),
+        _tool("schema", "Machine-readable result shapes and exit codes.", {}, [], ["schema"]),
+    ]
+
+def tools_document():
+    return {
+        "name": "aria-dl",
+        "version": VERSION,
+        "description": "Download manager for people and for AI agents. Queue torrents, magnets, HTTP(S), and video, then inspect jobs as JSON.",
+        "invoke": "aria-dl <command> [args] --json --non-interactive",
+        "notes": [
+            "Parse all of stdout as one JSON value. It is pretty-printed, not JSON Lines. jq is optional.",
+            "Progress and human errors are on stderr.",
+            "For OpenAI-style tools, copy name, description, and parameters. input_schema is the same object for Anthropic. aria_dl tells a wrapper how to build argv.",
+            "Proxy fields are host:port. Cookie values and proxy usernames are never printed.",
+            "status without --wait exits 0 when the id exists. status --wait exits with the job outcome.",
+        ],
+        "tools": tool_list(),
+    }
+
+def schema_document():
+    progress = {
+        "type": "object",
+        "properties": {
+            "percent": {"type": ["integer", "null"]},
+            "done": {"type": ["string", "null"]},
+            "total": {"type": ["string", "null"]},
+            "done_bytes": {"type": ["integer", "null"]},
+            "total_bytes": {"type": ["integer", "null"]},
+            "speed": {"type": ["string", "null"]},
+            "eta": {"type": ["string", "null"]},
+            "connections": {"type": ["integer", "null"]},
+            "seeds": {"type": ["integer", "null"]},
+        },
+    }
+    job = {
+        "type": "object",
+        "additionalProperties": True,
+        "description": "One download. Ignore unknown properties. Top-level percent, done, total, speed, eta, connections, and seeds repeat progress for older clients.",
+        "required": ["id", "url", "source", "kind", "state", "progress", "bytes", "output_paths", "dir", "last_error", "hint"],
+        "properties": {
+            "id": {"type": "string", "description": "8 hex characters, sha1 of the source."},
+            "url": {"type": ["string", "null"], "description": "Source when it is a URL or magnet. Null for a local torrent path."},
+            "source": {"type": ["string", "null"], "description": "Source with URL userinfo removed."},
+            "kind": {"type": "string", "enum": ["magnet", "media", "url", "torrent"]},
+            "state": {"type": "string", "enum": ["queued", "running", "waiting", "retrying", "paused", "complete", "failed", "removed"]},
+            "progress": progress,
+            "bytes": {"type": "object", "properties": {"done": {"type": ["integer", "null"]}, "total": {"type": ["integer", "null"]}}},
+            "output_paths": {"type": "array", "items": {"type": "string"}},
+            "dir": {"type": ["string", "null"]},
+            "last_error": {"type": ["string", "null"], "description": "youtube_bot_check, network, dependency_missing, or null."},
+            "hint": {"type": ["string", "null"], "description": "Next action for a person or an agent."},
+            "missing_tool": {"type": ["string", "null"]},
+            "proxy": {"type": ["string", "null"], "description": "host:port only."},
+            "proxy_configured": {"type": "boolean"},
+            "cookies_from_browser": {"type": ["string", "null"], "description": "Browser name, never cookie values."},
+            "retry_count": {"type": "integer"},
+            "max_retries": {"type": "integer"},
+            "next_retry_at": {"type": ["string", "null"]},
+            "exit_code": {"type": ["integer", "null"]},
+            "existed": {"type": "boolean", "description": "Present on add. True when this URL was already a job."},
+            "action": {"type": "string", "enum": ["created", "requeued", "exists"], "description": "Present on add."},
+            "timed_out": {"type": "boolean", "description": "Present on status --wait."},
+            "ok": {"type": "boolean", "description": "Present on add. False when the source was rejected or aria2c/yt-dlp is missing."},
+        },
+    }
+    return {
+        "name": "aria-dl",
+        "version": VERSION,
+        "json_style": "One pretty-printed JSON value (indent 1) on stdout. Not JSON Lines. Parse the whole stdout. jq is not required.",
+        "job": job,
+        "results": {
+            "add": "One positional source: a job object. --file or several sources: an array. A rejected source is {ok:false, source, error, hint?} and the process exits 1. A saved job that could not start because aria2c or yt-dlp is missing has ok false and the process exits 5.",
+            "list": "Array of jobs. [] when empty.",
+            "status": "One id: a job object. Several ids: an array. --wait is one id and adds timed_out.",
+            "pause": "One id: a job object. Several ids, or all: an array.",
+            "resume": "Same shape as pause. Selectors other than a bare all print text unless --json, which is an array.",
+            "remove": "Same shape as resume. Downloaded files are not deleted.",
+            "log": "{id, lines}. Lines are redacted.",
+            "config_get": "{key, value} for one key, or an object of youtube_proxy, proxy, cookies_from_browser. Proxy values are host:port or null.",
+            "config_set": "{key, value} with the proxy reduced to host:port.",
+            "config_unset": "{key, value: null, unset: true}.",
+            "cookies_status": "{path, exists, mtime, age_seconds, cookie_count, login, earliest_expiry, hint}. No cookie names or values.",
+            "cookies_refresh": "{ok, browser, cookie_count, login, path} or {ok:false, error, hint?}.",
+            "version": "{name, version, python, dependencies:{aria2c, yt-dlp, ffmpeg}}.",
+            "error": "{ok:false, error, message, hint?}. error is usage, not_found, or cancelled.",
+        },
+        "exit_codes": {
+            "0": "Success. status without --wait exits 0 whenever the id exists, including when the job itself failed.",
+            "1": "Failure. A source was rejected, a batch was partial, or status --wait ended in a failed job.",
+            "2": "Usage. Bad flags, missing arguments, or an unknown config key.",
+            "3": "Not found. No unique job for that id.",
+            "4": "status --wait ended with last_error youtube_bot_check or network.",
+            "5": "aria2c or yt-dlp is missing. add still keeps the job and exits 5 when it could not start.",
+            "6": "status --wait timed out. The job is still running, queued, waiting, retrying, or paused.",
+            "130": "Interrupted by SIGINT.",
+        },
+        "env": {
+            "ARIA_DL_JSON": "1, true, yes, or on forces JSON on stdout.",
+            "ARIA_DL_YES": "Same as --yes / --non-interactive.",
+            "ARIA_DL_HOME": "State directory. Default ~/.local/share/aria-dl.",
+            "ARIA_DL_MAX_RETRIES": "Default cross-process retry cap.",
+            "ARIA_DL_MAX_MEDIA": "Concurrent yt-dlp jobs. Default 2.",
+            "ARIA_DL_MAX_ARIA": "Concurrent aria2c jobs. Default 3.",
+            "ARIA_DL_YOUTUBE_PROXY": "yt-dlp proxy for YouTube media jobs.",
+            "ARIA_DL_PROXY": "yt-dlp proxy for every media job.",
+            "ARIA_DL_COOKIES_FROM_BROWSER": "Browser spec. Not cookie values.",
+            "ARIA_DL_PATH": "Tool search path used instead of the built-in default. The caller PATH is still appended for downloads.",
+        },
+    }
+
+def version_info():
+    return {
+        "name": "aria-dl",
+        "version": VERSION,
+        "python": "%d.%d.%d" % sys.version_info[:3],
+        "dependencies": {"aria2c": tool_ok("aria2c"), "yt-dlp": tool_ok("yt-dlp"), "ffmpeg": tool_ok("ffmpeg")},
+    }
+
+def main(argv=None):
+    global OUT_JSON
+    argv = preprocess(list(sys.argv if argv is None else argv))
+    ap = build_parser()
+    o = ap.parse_args(argv[1:])
+    OUT_JSON = bool(getattr(o, "json", False) or GLOBAL_JSON or env_on("ARIA_DL_JSON"))
     os.makedirs(JOBS, exist_ok=True)
-    if o.cmd == "add" and o.retries < 0: sys.exit("aria-dl: --retries must be >= 0")
-    if o.cmd == "add" and o.proxy is not None and o.no_proxy: sys.exit("aria-dl: use either --proxy or --no-proxy")
+    if o.cmd == "add" and o.retries < 0: fail(EXIT_USAGE, "usage", "--retries must be >= 0")
+    if o.cmd == "add" and o.proxy is not None and o.no_proxy: fail(EXIT_USAGE, "usage", "use either --proxy or --no-proxy")
     try:
-        dispatch(o)
-    finally:
-        arm_retry_wake()
+        try:
+            dispatch(o)
+        finally:
+            arm_retry_wake()
+    except KeyboardInterrupt:
+        if OUT_JSON or GLOBAL_JSON or env_on("ARIA_DL_JSON"):
+            emit({"ok": False, "error": "cancelled", "message": "interrupted"})
+        print("aria-dl: interrupted", file=sys.stderr)
+        sys.exit(EXIT_INTERRUPTED)
 
 def saved_jobs():
     os.makedirs(JOBS, exist_ok=True)
@@ -774,7 +1277,7 @@ def arm_retry_wake():
         me = os.path.realpath(__file__)
         p = subprocess.Popen(["/bin/sh", "-c", WAKE_SCRIPT, "wake", str(delay), WAKE, token, me],
                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                             start_new_session=True, env={**os.environ, "PATH": PATH})
+                             start_new_session=True, env={**os.environ, "PATH": DEFAULT_PATH})
         tmp = WAKE + ".tmp"
         with open(tmp, "w") as f: json.dump({"pid": p.pid, "at": when, "token": token}, f)
         os.replace(tmp, WAKE)
@@ -814,46 +1317,89 @@ def config_show(key, value):
         if value is None or proxy_disabled(value): return ""
         return proxy_hostport(value) or ""
     return "" if value is None else str(value)
+def config_public(key, value):
+    if key in ("youtube_proxy", "proxy"):
+        if value is None or proxy_disabled(value): return None
+        return proxy_hostport(str(value))
+    if value is None: return None
+    return str(value)
 def config_cli(o):
     key = getattr(o, "key", None)
-    if key and key not in CONFIG_KEYS: sys.exit("aria-dl: unknown config key %s" % key)
+    if key and key not in CONFIG_KEYS:
+        fail(EXIT_USAGE, "usage", "unknown config key %s" % key, "Keys: %s." % ", ".join(CONFIG_KEYS))
     data = load_config()
     if o.config_cmd == "set":
         data[o.key] = o.value
         save_config(data)
-        print("%s=%s" % (o.key, config_show(o.key, o.value)))
+        shown = config_public(o.key, o.value)
+        if OUT_JSON: emit({"key": o.key, "value": shown})
+        else: print("%s=%s" % (o.key, "" if shown is None else shown))
     elif o.config_cmd == "unset":
         data.pop(o.key, None)
         save_config(data)
-        print("unset %s" % o.key)
+        if OUT_JSON: emit({"key": o.key, "value": None, "unset": True})
+        else: print("unset %s" % o.key)
     elif o.key:
-        print(config_show(o.key, data.get(o.key)))
+        shown = config_public(o.key, data.get(o.key)) if o.key in data else None
+        if OUT_JSON: emit({"key": o.key, "value": shown})
+        else: print(config_show(o.key, data.get(o.key)))
+    elif OUT_JSON:
+        emit({name: (config_public(name, data.get(name)) if name in data else None) for name in CONFIG_KEYS})
     else:
         for name in CONFIG_KEYS:
             if name in data: print("%s=%s" % (name, config_show(name, data.get(name))))
+def present_add(views, errors, from_batch):
+    if OUT_JSON:
+        if not from_batch and len(views) == 1 and not errors: out(views[0], True)
+        elif not from_batch and not views and len(errors) == 1: out(errors[0], True)
+        else: out(list(views) + list(errors), True)
+    elif views:
+        out(views, False)
+    if not OUT_JSON:
+        for v in views:
+            if v.get("last_error") == "dependency_missing" and v.get("hint"):
+                print(v["hint"], file=sys.stderr)
+    if errors: sys.exit(EXIT_FAIL)
+    if any(v.get("last_error") == "dependency_missing" for v in views): sys.exit(EXIT_DEPENDENCY)
 def dispatch(o):
     if o.cmd == "add":
         sources, from_batch = collect_sources(o)
-        ids, errors = [], []
+        made, errors = [], []
         for idx, s in enumerate(sources, 1):
             label = f"{o.name} #{idx}" if (o.name and len(sources) > 1) else o.name
             try:
-                ids.append(add_one(s, o, label=label))
+                made.append(add_one(s, o, label=label))
+            except ValueError as e:
+                msg = redact(str(e))
+                errors.append({"ok": False, "source": redact(s), "error": msg,
+                               "hint": "Pass a magnet link, an http(s) URL, an existing .torrent path, or --media for a video page."})
+                print("aria-dl: error adding %s: %s" % (redact(s), msg), file=sys.stderr)
             except Exception as e:
-                errors.append({"source": s, "error": str(e)})
-                print(f"aria-dl: error adding {s}: {e}", file=sys.stderr)
-        if ids: tick()
-        views = [view(refresh(load(i))) for i in ids]
-        if from_batch:
-            if o.json: out(views + errors if errors else views, True)
-            else: out(views, False)
-        elif views:
-            out(views[0], o.json)
-        if errors: sys.exit(1)
-    elif o.cmd == "list": out([view(j) for j in all_jobs()], o.json)
+                msg = redact(str(e))
+                errors.append({"ok": False, "source": redact(s), "error": msg})
+                print("aria-dl: error adding %s: %s" % (redact(s), msg), file=sys.stderr)
+        if made: tick()
+        views = []
+        for i, action in made:
+            v = view(refresh(load(i)))
+            v["existed"] = action != "created"
+            v["action"] = action
+            v["ok"] = v.get("last_error") != "dependency_missing"
+            views.append(v)
+        present_add(views, errors, from_batch)
+    elif o.cmd == "list": out([view(j) for j in all_jobs()], OUT_JSON)
     elif o.cmd == "status":
+        if (o.wait or o.timeout is not None) and len(o.ids) != 1:
+            fail(EXIT_USAGE, "usage", "--wait takes exactly one job id")
+        if o.timeout is not None and o.timeout < 0:
+            fail(EXIT_USAGE, "usage", "--timeout must be >= 0")
+        if o.wait or o.timeout is not None:
+            j = find(o.ids[0])
+            v = wait_for(j["id"], o.timeout)
+            out(v, OUT_JSON, hints=True)
+            sys.exit(exit_for_job(v))
         views = [view(find(i)) for i in o.ids]
-        out(views if len(views) > 1 else views[0], o.json, hints=True)
+        out(views if len(views) > 1 else views[0], OUT_JSON, hints=True)
     elif o.cmd == "pause":
         targets = [j for j in all_jobs() if j["state"] in ("running", "queued", "waiting", "retrying")] if o.ids == ["all"] else [find(i) for i in o.ids]
         for j in targets:
@@ -861,48 +1407,68 @@ def dispatch(o):
             j["next_retry_ts"] = j["next_retry_at"] = None
             save(j)
         views = [view(j) for j in targets]
-        out(views if (len(o.ids) > 1 or o.ids == ["all"]) else (views[0] if views else []), o.json)
+        out(views if (len(o.ids) > 1 or o.ids == ["all"]) else (views[0] if views else []), OUT_JSON)
     elif o.cmd == "resume":
         pure_all = o.ids == ["all"]
         targets, labels, named = pick_targets(o.ids, RESUME_SELECTORS)
         if not targets:
-            if named or pure_all: no_match(o.json)
+            if named or pure_all: no_match(OUT_JSON)
         else:
             for j in targets: queue_resume(j)
             tick()
             views = [view(refresh(load(j["id"]))) for j in targets]
             if named and not pure_all:
-                if o.json: out(views, True)
+                if OUT_JSON: out(views, True)
                 else: print(bulk_line("resumed", len(views), labels))
             else:
-                out(views if (len(o.ids) > 1 or pure_all) else views[0], o.json)
+                out(views if (len(o.ids) > 1 or pure_all) else views[0], OUT_JSON)
     elif o.cmd == "remove":
         targets, labels, named = pick_targets(o.ids, REMOVE_SELECTORS)
         if named and not targets:
-            no_match(o.json)
+            no_match(OUT_JSON)
         else:
             views = []
             for j in targets:
                 stop(j, "removed"); views.append(view(j)); shutil.rmtree(jdir(j["id"]))
-                if not named and not o.json:
-                    print(f"removed job {j['id']} (files kept in {j['dir']})")
+                if not named and not OUT_JSON:
+                    print("removed job %s (files kept in %s)" % (j["id"], j["dir"]))
             if targets: tick()
             if named:
-                if o.json: out(views, True)
+                if OUT_JSON: out(views, True)
                 else: print(bulk_line("removed", len(views), labels))
-            elif o.json:
+            elif OUT_JSON:
                 out(views if len(views) > 1 else views[0], True)
     elif o.cmd == "log":
-        j = find(o.id); subprocess.run(["tail", f"-n{o.n}", os.path.join(jdir(j["id"]), "aria2.log")])
+        j = find(o.id)
+        path = os.path.join(jdir(j["id"]), "aria2.log")
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f: lines = f.read().splitlines()
+        except OSError:
+            lines = []
+        lines = [redact(x) for x in lines[-max(0, o.n):]]
+        if OUT_JSON: emit({"id": j["id"], "lines": lines})
+        else:
+            for line in lines: print(line)
     elif o.cmd == "cookies":
         if o.cookies_cmd == "status":
             info = cookies_status()
-            if o.json: print(json.dumps(info, ensure_ascii=False, indent=1))
+            if OUT_JSON: emit(info)
             else: print_cookies_status(info)
         else:
-            emit_refresh(perform_refresh(o.browser or default_cookie_browser()), o.json)
+            emit_refresh(perform_refresh(o.browser or default_cookie_browser()), OUT_JSON)
     elif o.cmd == "config":
         config_cli(o)
+    elif o.cmd == "version":
+        info = version_info()
+        if OUT_JSON: emit(info)
+        else:
+            print("aria-dl %s" % info["version"])
+            for name, ok in info["dependencies"].items():
+                print("%s: %s" % (name, "yes" if ok else "no"))
+    elif o.cmd == "schema":
+        emit(schema_document())
+    elif o.cmd == "tools":
+        emit(tools_document())
     elif o.cmd == "tick": tick()
 
 if __name__ == "__main__": main()

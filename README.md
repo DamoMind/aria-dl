@@ -1,8 +1,10 @@
 # aria-dl
 
-A lightweight, zero-dependency Python CLI wrapper around `aria2c` and `yt-dlp` for managing background downloads on macOS (and Linux) — designed to be ergonomic both for humans and for AI agents (`--json` output).
+A download queue for people and for AI agents.
 
-Supports **`.torrent` files, magnet links, HTTP(S)/FTP URLs, and video sites** (YouTube, Bilibili, X/Twitter, Vimeo, Niconico, TikTok, Instagram, SoundCloud, etc.), with batch input, concurrency queuing, automatic resume, and optional **night-only + Wi-Fi-only** scheduling.
+One single-file command runs torrents, magnet links, HTTP(S) files, and video or audio pages (YouTube and other sites through `yt-dlp`). In a terminal you get a one-line status. An agent gets one JSON document on stdout, documented exit codes, `status --wait`, and a function-calling schema (`aria-dl tools`). No extra Python packages.
+
+Supports **`.torrent` files, magnet links, HTTP(S)/FTP URLs, and video sites** (YouTube, Bilibili, X/Twitter, Vimeo, Niconico, TikTok, Instagram, SoundCloud, and others), with batch input, a concurrency queue, automatic resume, retries, and optional **night-only + Wi-Fi-only** scheduling.
 
 ## Features
 
@@ -11,8 +13,83 @@ Supports **`.torrent` files, magnet links, HTTP(S)/FTP URLs, and video sites** (
 - **Night + Wi-Fi scheduling (`--when night`)**: downloads only between `22:00–08:00` local time when the default network route is Wi-Fi, automatically pausing outside that window and resuming later.
 - **Resumable & non-destructive**: passes `--continue` to both `aria2c` and `yt-dlp`; `aria-dl remove` deletes only the job record, never downloaded files.
 - **Automatic retries**: `yt-dlp` retries transient network errors in-process. If a download process still fails, the job waits out a backoff (2m, 5m, 15m, 30m, 60m) and tries again, up to `--retries` (default 5), then stops.
-- **Agent-friendly**: every command supports `--json` for structured output (status, percent, downloaded/total size, speed, peers, ETA, destination directory).
-- **Single-file stdlib Python 3**: no pip dependencies required.
+- **Agent-friendly**: `--json` or `ARIA_DL_JSON=1` prints one stable JSON value on stdout (job id, url, kind, state, progress, bytes, paths, last error, hint). Logs stay on stderr. `aria-dl tools` prints a function-calling schema. `status ID --wait` blocks until the job finishes.
+- **Single-file stdlib Python 3**: no pip dependencies required. jq is optional and is not used to produce JSON.
+
+## Use with AI agents
+
+Humans and agents use the same `aria-dl` binary and the same LaunchAgent install. Pass `--json` (or export `ARIA_DL_JSON=1`) on every call you intend to parse. `--yes` / `--non-interactive` are accepted; the CLI does not prompt, and a non-TTY stdin does not prompt either.
+
+```bash
+aria-dl add 'https://example.com/file.zip' --json --non-interactive
+aria-dl status JOBID --wait --timeout 600 --json
+aria-dl list --json
+aria-dl config get youtube_proxy --json
+aria-dl cookies status --json
+aria-dl version --json
+aria-dl tools --json    # paste into a tool registry
+aria-dl schema          # result shapes and exit codes
+```
+
+`list` is always a JSON array. One id is a JSON object; several ids, `--file`, or several sources are an array. Parse the whole stdout with a JSON parser. Output is pretty-printed, not JSON Lines. Progress during `--wait` is on stderr.
+
+A job object includes `id`, `url`, `source`, `kind`, `state`, `progress`, `bytes`, `output_paths`, `dir`, `last_error`, and `hint`. `add` also reports `existed` and `action` (`created`, `requeued`, or `exists`). The same URL is the same id (`sha1` prefix); adding it again does not create a second job. A running or complete job is left unchanged.
+
+`status ID` without `--wait` exits 0 when the id exists, including when that job has failed. Use `--wait` when the exit code should be the download result. `--timeout 0` checks once. Omit `--timeout` to wait until complete, failed, or removed. Retries and the night window are not terminal, so pass a timeout.
+
+| Exit | Meaning |
+| --- | --- |
+| 0 | Success. A plain `status` of an existing id is success even if the job failed. |
+| 1 | A source was rejected, a batch was partial, or `--wait` ended failed. |
+| 2 | Usage error. |
+| 3 | No unique job for that id. |
+| 4 | `--wait` ended with a YouTube bot-check or a network error. |
+| 5 | `aria2c` or `yt-dlp` is missing. The job is kept; install the tool and `resume` the id. |
+| 6 | `--wait` timed out. The job is still in progress. |
+| 130 | Interrupted. |
+
+On exit 4 with `last_error` `youtube_bot_check`, ask the user to run `aria-dl cookies refresh` in a terminal, or set a yt-dlp proxy. Do not invent cookie values.
+
+Register the CLI as tools with the JSON from `aria-dl tools`. Copy `name`, `description`, and `parameters` for OpenAI-style function calling. `input_schema` is the same object for Anthropic. A short `status` tool looks like:
+
+```json
+{
+  "name": "status",
+  "description": "Show jobs. Add wait to block until complete or failed and use the process exit code.",
+  "parameters": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["ids"],
+    "properties": {
+      "ids": {"type": "array", "items": {"type": "string"}},
+      "wait": {"type": "boolean"},
+      "timeout": {"type": "number", "minimum": 0}
+    }
+  }
+}
+```
+
+`examples/mcp_server.py` is an optional stdlib MCP stdio server (`python3 examples/mcp_server.py`). `install.sh` does not install it. `AGENTS.md` is the short reference to give an agent.
+
+Example instruction to an agent:
+
+```text
+Drive aria-dl with --json and --non-interactive. Parse stdout only.
+Add the URL the user named, then `aria-dl status ID --wait --timeout 600 --json`.
+Exit 0 means the file is complete. Exit 4 means a YouTube bot-check or a network error:
+tell the user to run `aria-dl cookies refresh` in a terminal, or to set youtube_proxy.
+Exit 5 means aria2c or yt-dlp is not installed. Exit 6 means the wait timed out; report the state.
+Never print or invent cookies. Proxy fields are host:port only.
+```
+
+Safety:
+
+- JSON never includes cookie values or proxy usernames and passwords. Proxy fields are `host:port`.
+- The proxy is passed only to `yt-dlp`. It does not set `HTTP_PROXY`, `HTTPS_PROXY`, or the system proxy. If that port is closed, the attempt goes direct and the log says `proxy unreachable, falling back to direct`.
+- URL userinfo is removed in JSON. Query strings are kept, so do not put tokens in the URL you add.
+- The cookie file stays mode `0600` and is not printed. `cookies status` reports age, count, and whether a login cookie is present.
+- `remove` deletes the job record only. Files already on disk stay.
+- `ARIA_DL_HOME` points at an isolated queue. The default remains `~/.local/share/aria-dl`. Leave `ARIA_DL_JSON` unset in the LaunchAgent; `tick` is silent either way.
 
 ## Requirements
 
@@ -72,6 +149,7 @@ pbpaste | aria-dl add --audio
 ```bash
 aria-dl list                       # List all jobs and progress
 aria-dl status <ID> [ID2 ...]      # Job details (ID prefix matching supported)
+aria-dl status <ID> --wait --timeout 600   # Block until complete or failed
 aria-dl pause <ID> [ID2 ...]       # Pause one or more jobs, including retrying (or: aria-dl pause all)
 aria-dl resume <ID> [ID2 ...]      # Resume; failed/retrying jobs reset their retry counter
 aria-dl resume all                 # Re-queue paused, failed, waiting, and retrying
@@ -79,7 +157,7 @@ aria-dl log <ID> -n 50             # Tail recent download log
 aria-dl remove <ID> [ID2 ...]      # Forget job records (keeps downloaded files)
 ```
 
-Append `--json` to any command for machine-readable output (single job returns a JSON object; batch operations return a JSON array).
+Append `--json` for machine-readable output (one job is an object; `list` and batch operations are an array). Field list, exit codes, and `--wait` are in [Use with AI agents](#use-with-ai-agents). `jq` can filter that JSON and is not required to produce it.
 
 ## Bulk operations
 
@@ -179,8 +257,15 @@ Before each attempt, aria-dl opens a TCP connection to the proxy host and port (
 ## Security & Privacy Notes
 
 - All job metadata and logs stay locally under `~/.local/share/aria-dl/jobs/<ID>/`.
-- Avoid passing secrets or authenticated tokens directly in CLI arguments if other local users share the machine.
+- Avoid passing secrets or authenticated tokens directly in CLI arguments if other local users share the machine. JSON strips URL userinfo and shows a proxy as `host:port` only. Cookie values are never printed.
+- The download proxy is an argument on the yt-dlp process only. Other apps stay direct, and a closed proxy port falls back to a direct attempt.
 - BitTorrent jobs use `--seed-time=0` (stop seeding once complete) and fetch public trackers from `https://cf.trackerslist.com/best_aria2.txt`.
+
+## Tests
+
+```bash
+python3 tests/test_agent_cli.py
+```
 
 ## License
 
